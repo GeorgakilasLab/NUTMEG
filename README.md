@@ -43,6 +43,6 @@ NUTMEG is demonstrated via two notebook tutorials:
 Clone and install in editable mode:
 
 ```bash
-git clone https://github.com/<USER>/nutmeg.git
+git clone https://github.com/GeorgakilasLab/NUTMEG.git
 cd nutmeg
 pip install -e .
