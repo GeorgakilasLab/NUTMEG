@@ -1,4 +1,4 @@
-# NUTMEG
+# NUTMEG - iNsights from single cell mUlTioMics with interpretable GNNs
 
 NUTMEG is a Python framework for cell-type classification and regulatory program discovery from paired single-cell multiome data (scRNA-seq + scATAC-seq), built around graph-based attention.
 
