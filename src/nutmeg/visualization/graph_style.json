@@ -1,0 +1,115 @@
+{
+  "node_styles": {
+    "TF": {
+      "label": "TF",
+      "color": "#E160B6",
+      "shape": "ellipse",
+      "border_color": "#111111",
+      "border_width": 1
+    },
+    "Gene": {
+      "label": "Gene",
+      "color": "#0AC0B4",
+      "shape": "ellipse",
+      "border_color": "#0AC0B4",
+      "border_width": 1
+    },
+    "CRE_promoter": {
+      "label": "CRE promoter",
+      "color": "#B4C012",
+      "shape": "diamond",
+      "border_color": "#111111",
+      "border_width": 1
+    },
+    "CRE_distal": {
+      "label": "CRE distal",
+      "color": "#007C1D",
+      "shape": "diamond",
+      "border_color": "#111111",
+      "border_width": 1
+    },
+    "CRE_unknown": {
+      "label": "CRE unknown",
+      "color": "#888888",
+      "shape": "diamond",
+      "border_color": "#111111",
+      "border_width": 1
+    }
+  },
+  "edge_styles": {
+    "TF_CRE": {
+      "label": "TF → CRE",
+      "color": "#9ECAE1"
+    },
+    "CRE_GENE": {
+      "label": "CRE → Gene",
+      "color": "#969696"
+    }
+  },
+  "legend_sizes": {
+    "node_icon": 16,
+    "node_small": 10,
+    "node_large": 20,
+    "edge_width": 4,
+    "edge_small": 2,
+    "edge_large": 5,
+    "edge_length": 28,
+    "line_width_px": 28
+  },
+  "size_scales": {
+    "nodes": {
+      "min": 16,
+      "max": 42
+    },
+    "edges": {
+      "min": 2,
+      "max": 6
+    }
+  },
+  "defaults": {
+    "border_color": "#111111",
+    "border_width": 1,
+    "fallback_edge_color": "#BBBBBB",
+    "dual_role_border_width": 4
+  },
+  "text": {
+    "node_font_size": 11,
+    "node_text_color": "#000000",
+    "text_valign": "center",
+    "text_halign": "center",
+    "text_wrap": "wrap",
+    "text_max_width": 100
+  },
+  "edges": {
+    "curve_style": "bezier",
+    "target_arrow_shape": "triangle",
+    "opacity": 0.7
+  },
+  "layout": {
+    "available_layouts": ["cose", "concentric", "breadthfirst", "circle"],
+    "default_layout": "cose",
+    "widget_width": "100%",
+    "widget_height": "520px",
+    "container_height": "auto",
+    "show_cre_labels": false
+  },
+  "controls": {
+    "class_width": "220px",
+    "regulon_width": "140px",
+    "regulon_box_height": "180px",
+    "support_width": "300px",
+    "layout_width": "180px",
+    "gap": "8px",
+    "support_readout_format": ".3f"
+  },
+  "panels": {
+    "font_family": "sans-serif",
+    "border": "1px solid #ddd",
+    "padding": "8px",
+    "info_min_height": "140px",
+    "sidebar_width": "250px",
+    "gap": "8px",
+    "main_gap": "10px",
+    "container_padding": "8px"
+  }
+}
