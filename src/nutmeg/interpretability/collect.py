@@ -6,7 +6,7 @@ import torch
 from torch_geometric.loader import DataLoader
 
 from nutmeg.trainer import ListDataset
-from nutmeg.utils import (
+from .utils import (
     _batch_ptr,
     _default_bundle_dir,
     _get_cre_local_to_global,

@@ -44,5 +44,5 @@ Clone and install in editable mode:
 
 ```bash
 git clone https://github.com/GeorgakilasLab/NUTMEG.git
-cd nutmeg
+cd src/nutmeg
 pip install -e .
