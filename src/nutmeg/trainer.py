@@ -86,17 +86,14 @@ class NUTMEGTrainer:
 
         self.log_path = self.train_dir / "train.log.txt"
 
-        # scalers
         self.scaler_tf = StandardScaler()
         self.scaler_gene = StandardScaler()
         self.scaler_cre = StandardScaler()
 
-        # objects
         self.model = None
         self.criterion = None
         self.optimizer = None
 
-        # tracking
         self.history = []
         self.best_state_dict = None
         self.best_epoch = -1
@@ -160,7 +157,7 @@ class NUTMEGTrainer:
         self._log(f"[init] num_genes={self._infer_num_genes()} (num_classes initial={num_classes})")
     
     # --------------------------
-    # Scalers (fit on a dataset)
+    # Scalers 
     # --------------------------
     def fit_scalers(self, train_ds):
         X_tf_list, X_gene_list, X_cre_list = [], [], []
@@ -430,7 +427,6 @@ class NUTMEGTrainer:
         # build loss/opt using internal train subset
         self._build_criterion_optimizer(tr_ds)
 
-        # materialize
         tr_graphs = self._materialize_graphs_from_ds(tr_ds)
         va_graphs = self._materialize_graphs_from_ds(va_ds)
 
@@ -478,7 +474,6 @@ class NUTMEGTrainer:
         if self.best_state_dict is not None:
             self.model.load_state_dict(self.best_state_dict)
 
-        # Save training artifacts
         weights_path = self.train_dir / "best_state_dict.pt"
         torch.save(self.model.state_dict(), weights_path)
 
@@ -548,11 +543,6 @@ class NUTMEGTrainer:
 
     @torch.no_grad()
     def evaluate(self, test_ds):
-        """
-        Input: test_ds (Subset or Dataset)
-        Output folder:
-        - plots/<run_id>/ : classification report, confusion matrix, test metrics, per-class metrics plot
-        """
         bs = int(self.cfg["train"].get("train_batch_size", 64))
 
         test_graphs = self._materialize_graphs_from_ds(test_ds)
@@ -588,7 +578,6 @@ class NUTMEGTrainer:
         (self.plots_dir / "classification_report.txt").write_text(rep_txt, encoding="utf-8")
         (self.plots_dir / "classification_report.json").write_text(json.dumps(rep_dict, indent=2), encoding="utf-8")
 
-        # confusion matrix plot (saved)
         cm_path = self.plots_dir / "confusion_matrix.png"
         self._save_confusion_matrix_plot(
             m["y_true"], m["y_pred"],
@@ -598,7 +587,6 @@ class NUTMEGTrainer:
             display_labels=target_names
         )
 
-        # per-class metrics 
         per_class_path = self.plots_dir / "per_class_metrics.png"
         self._save_per_class_metrics_plot(rep_dict, per_class_path, title="Per-class metrics")
 

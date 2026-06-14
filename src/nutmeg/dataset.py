@@ -72,7 +72,6 @@ class BaseGRN:
         self.tf_peak_df = pd.read_csv(self.cfg.tf_peak_scores_csv)
         self.peaks_genes_df = pd.read_csv(self.cfg.peaks_genes_csv)
 
-        # Validate required columns:
         need_tf = {self.cfg.tf_col, self.cfg.peak_col, self.cfg.tf_score_col}
         need_pg = {self.cfg.peak_col, self.cfg.gene_col}
 
@@ -84,7 +83,6 @@ class BaseGRN:
         if missing_pg:
             raise ValueError(f"peaks_genes_csv missing columns: {sorted(missing_pg)}")
 
-        # Normalize dtypes:
         self.tf_peak_df[self.cfg.tf_col] = self.tf_peak_df[self.cfg.tf_col].astype(str)
         self.tf_peak_df[self.cfg.peak_col] = self.tf_peak_df[self.cfg.peak_col].astype(str)
 
@@ -327,15 +325,12 @@ class AutoDiscoveredFiles:
     tf_features: str
     gene_features: str
 
-    # raw matrices (in raw/)
     tf_raw_mtx: str
     gene_raw_mtx: str
 
-    # processed matrices (in processed/)
     tf_sct_mtx: str
     gene_sct_mtx: str
 
-    # CRE bits (multiome only)
     cre_features: Optional[str] = None
     cre_counts_raw_mtx: Optional[str] = None
     cre_counts_mtx: Optional[str] = None
@@ -439,15 +434,12 @@ class AutoFeatureLoader:
 
         mats: Dict[str, Tuple[Any, List[str], List[str]]] = {}
 
-        # Processed (SCT)
         mats["tf_feat"] = load_triplet(files.tf_sct_mtx, files.tf_features, "tf_feat")
         mats["gene_feat"] = load_triplet(files.gene_sct_mtx, files.gene_features, "gene_feat")
 
-        # Raw
         mats["tf_raw"] = load_triplet(files.tf_raw_mtx, files.tf_features, "tf_raw")
         mats["gene_raw"] = load_triplet(files.gene_raw_mtx, files.gene_features, "gene_raw")
 
-        # CRE only in multiome
         if mode == "multiome":
             if files.cre_counts_mtx is None or files.cre_counts_raw_mtx is None or files.cre_features is None:
                 raise FileNotFoundError("mode=multiome but CRE files are missing (cre_features/cre_counts*.mtx).")
@@ -499,11 +491,9 @@ class PerCellGraphDataset(Dataset):
             self.cre_names = cre_names or []
             self.cre_node_names = cre_node_names or []
 
-        # keep original barcode order
         self.master_cols = list(cells)
         self.barcode2col = {cid: i for i, cid in enumerate(self.master_cols)}
 
-        # ---------- Labels: prune -> build contiguous IDs  ----------
         self.global_label_to_id_input = dict(label_to_id) if label_to_id is not None else None
 
         if labels_dict is not None:
@@ -517,7 +507,6 @@ class PerCellGraphDataset(Dataset):
             kept = [c for c in self.master_cols if labels_dict.get(c) in valid_labels]
             self.labels_dict = {c: labels_dict[c] for c in kept}
 
-            # Build contiguous IDs *after* pruning:
             surviving_labels = sorted(set(self.labels_dict.values()))
             self.orig_label_to_compact = {lab: i for i, lab in enumerate(surviving_labels)}
             self.compact_to_orig = {i: lab for lab, i in self.orig_label_to_compact.items()}
@@ -546,7 +535,6 @@ class PerCellGraphDataset(Dataset):
         else:
             self.cre_pos = {}
 
-        # ---------- build row→scaffold maps ----------
         def _build_row_map(src_names, dst_pos):
             src_rows, dst_nodes = [], []
             for i, name in enumerate(src_names):
@@ -558,7 +546,6 @@ class PerCellGraphDataset(Dataset):
             return (np.asarray(src_rows, dtype=np.int64),
                     torch.as_tensor(dst_nodes, dtype=torch.long))
 
-        # row maps
         self.tf_src_rows, self.tf_dst_nodes = _build_row_map(self.tf_names, self.gene_pos)
         self.gene_src_rows, self.gene_dst_nodes = _build_row_map(self.gene_names, self.gene_pos)
 
@@ -568,7 +555,6 @@ class PerCellGraphDataset(Dataset):
             self.cre_src_rows = np.asarray([], dtype=np.int64)
             self.cre_dst_nodes = torch.empty((0,), dtype=torch.long)
         
-        # probe valid cells
         self.valid_cells = []
         for cid in self.all_cells:
             g = self.build_graph(cid)
@@ -587,7 +573,6 @@ class PerCellGraphDataset(Dataset):
             raise IndexError(f"[__getitem__] Failed to build graph for {cid}")
         return g
 
-    # -------- internals --------
     def _col_from(self, mtx, rows, col):
         return torch.tensor(mtx[rows, col].toarray().ravel(), dtype=torch.float32)
 
@@ -596,7 +581,6 @@ class PerCellGraphDataset(Dataset):
         if col is None:
             return None
 
-        # 1) per-cell features from aligned rows
         try:
             tf_cols   = [self._col_from(mtx,   self.tf_src_rows,   col) for mtx in self.tf_mtx_dict.values()]
             gene_cols = [self._col_from(mtx, self.gene_src_rows,   col) for mtx in self.gene_mtx_dict.values()]
@@ -612,7 +596,6 @@ class PerCellGraphDataset(Dataset):
             print(f"[build_graph] column slicing failed for cell {cell_id}: {e}")
             return None
 
-        # 2) place into scaffold-sized tensors
         graph = self.base_graph.clone()
 
         G = len(self.gene_node_names)
@@ -636,8 +619,6 @@ class PerCellGraphDataset(Dataset):
                 cre_feat_full[self.cre_dst_nodes] = cre_feats
             graph["cre"].x = cre_feat_full
 
-
-        # 3) prune to active subgraph 
         if self.prune:
             graph = self.prune_graph(graph, col)
             if graph is None:
@@ -647,7 +628,6 @@ class PerCellGraphDataset(Dataset):
             if self.mode == "multiome":
                 graph["cre"].kept_idx = torch.arange(len(self.cre_node_names), dtype=torch.long)
         
-        # 4) label → compact id
         if self.labels_dict is not None and self.orig_label_to_compact is not None:
             orig_lab = self.labels_dict.get(cell_id, None)
             y_id = self.orig_label_to_compact.get(orig_lab, -1)
@@ -655,10 +635,8 @@ class PerCellGraphDataset(Dataset):
         else:
             graph.y = torch.tensor([-1], dtype=torch.long)
 
-        # 5) numeric identifier
         graph.cell_idx = torch.tensor([col], dtype=torch.long)
 
-        # 6) counts
         graph['gene'].num_nodes = graph['gene'].tf_feats.size(0)
         if self.mode == "multiome":
             graph['cre'].num_nodes  = graph['cre'].x.size(0)
@@ -677,7 +655,6 @@ class PerCellGraphDataset(Dataset):
         else:
             return self._prune_graph_rna_only(graph, cell_col)
 
-    # ---------------- multiome prune ----------------
     def _prune_graph_multiome(self, graph, cell_col):
         ei_g2c = graph["gene", "binds", "cre"].edge_index
         ei_c2g = graph["cre", "regulates", "gene"].edge_index
@@ -722,12 +699,10 @@ class PerCellGraphDataset(Dataset):
         gene_map[kept_gene_idx] = torch.arange(kept_gene_idx.numel(), dtype=torch.long)
         cre_map[kept_cre_idx] = torch.arange(kept_cre_idx.numel(), dtype=torch.long)
 
-        # slice features
         graph["gene"].tf_feats = graph["gene"].tf_feats[kept_gene_idx]
         graph["gene"].gene_feats = graph["gene"].gene_feats[kept_gene_idx]
         graph["cre"].x = graph["cre"].x[kept_cre_idx]
 
-        # remap edges (gene->cre)
         new_g_src = gene_map[ei_g2c[0]]
         new_c_dst = cre_map[ei_g2c[1]]
         mask_g2c = (new_g_src >= 0) & (new_c_dst >= 0)
@@ -737,7 +712,6 @@ class PerCellGraphDataset(Dataset):
         if hasattr(graph["gene", "binds", "cre"], "edge_attr") and graph["gene", "binds", "cre"].edge_attr is not None:
             graph["gene", "binds", "cre"].edge_attr = graph["gene", "binds", "cre"].edge_attr[mask_g2c].float()
 
-        # remap edges (cre->gene)
         new_c_src = cre_map[ei_c2g[0]]
         new_g_dst = gene_map[ei_c2g[1]]
         mask_c2g = (new_c_src >= 0) & (new_g_dst >= 0)
@@ -747,7 +721,6 @@ class PerCellGraphDataset(Dataset):
         if hasattr(graph["cre", "regulates", "gene"], "edge_attr") and graph["cre", "regulates", "gene"].edge_attr is not None:
             graph["cre", "regulates", "gene"].edge_attr = graph["cre", "regulates", "gene"].edge_attr[mask_c2g].float()
 
-        # role masks after pruning
         N_gene = graph["gene"].tf_feats.size(0)
         outdeg = torch.bincount(graph[("gene", "binds", "cre")].edge_index[0], minlength=N_gene)
         indeg = torch.bincount(graph[("cre", "regulates", "gene")].edge_index[1], minlength=N_gene)
@@ -769,8 +742,7 @@ class PerCellGraphDataset(Dataset):
         graph["gene"].num_nodes = N_gene
         graph["cre"].num_nodes = graph["cre"].x.size(0)
         return graph
-
-    # ---------------- rna_only prune ----------------
+    
     def _prune_graph_rna_only(self, graph, cell_col):
         ei = graph["gene", "regulates", "gene"].edge_index
         src, dst = ei[0], ei[1]
@@ -788,7 +760,6 @@ class PerCellGraphDataset(Dataset):
         tf_nonzero[self.tf_dst_nodes] = torch.from_numpy(tf_expr > 0)
         gene_nonzero[self.gene_dst_nodes] = torch.from_numpy(gene_expr > 0)
 
-        # keep genes that (a) are expressed and participate in at least one edge
         has_out = torch.zeros(G, dtype=torch.bool); has_out[src] = True
         has_in = torch.zeros(G, dtype=torch.bool); has_in[dst] = True
         keep_gene = (has_out & tf_nonzero) | (has_in & gene_nonzero)
@@ -803,11 +774,9 @@ class PerCellGraphDataset(Dataset):
         gene_map = -torch.ones(G, dtype=torch.long)
         gene_map[kept_gene_idx] = torch.arange(kept_gene_idx.numel(), dtype=torch.long)
 
-        # slice features
         graph["gene"].tf_feats = graph["gene"].tf_feats[kept_gene_idx]
         graph["gene"].gene_feats = graph["gene"].gene_feats[kept_gene_idx]
 
-        # remap edges (gene->gene)
         new_src = gene_map[src]
         new_dst = gene_map[dst]
         mask_e = (new_src >= 0) & (new_dst >= 0)
@@ -818,7 +787,6 @@ class PerCellGraphDataset(Dataset):
         if hasattr(graph["gene", "regulates", "gene"], "edge_attr") and graph["gene", "regulates", "gene"].edge_attr is not None:
             graph["gene", "regulates", "gene"].edge_attr = graph["gene", "regulates", "gene"].edge_attr[mask_e].float()
 
-        # role masks after pruning 
         N_gene = graph["gene"].tf_feats.size(0)
         outdeg = torch.bincount(graph[("gene", "regulates", "gene")].edge_index[0], minlength=N_gene)
         indeg = torch.bincount(graph[("gene", "regulates", "gene")].edge_index[1], minlength=N_gene)
@@ -847,14 +815,12 @@ class PerCellGraphDataset(Dataset):
             seed: int = 42,
         ):
 
-
             if abs((train_frac + test_frac) - 1.0) > 1e-8:
                 raise ValueError("train_frac  + test_frac must sum to 1.0")
 
             if self.labels_dict is None or self.label_to_id is None:
                 raise ValueError("Cannot stratify/split: dataset has no labels_dict/label_to_id.")
 
-            # y aligned with self.valid_cells order
             y_all = np.array(
                 [self.label_to_id[self.labels_dict[c]] for c in self.valid_cells],
                 dtype=np.int64
@@ -910,7 +876,6 @@ class GRNDatasetManager:
         self.label_to_id: Optional[Dict[str, int]] = None
 
 
-    # ---------- step 1: base GRN ----------
     def _discover_csvs(self) -> None:
         csv_dir = os.path.join(self.paths.experiment_dir, "interm", "csv")
     
@@ -957,7 +922,6 @@ class GRNDatasetManager:
         
         return self.base_graph
 
-    # ---------- step 2: discover + load feature matrices ----------
     def load_feature_dir(self) -> None:
         if self.mode is None:
             raise RuntimeError("Call mgr.build_base_grn(mode=...) first so mode is known.")
@@ -968,7 +932,6 @@ class GRNDatasetManager:
         self.common_barcodes = self.mats["tf_feat"][2]
         print(f"[Feature] Loaded matrices for {len(self.common_barcodes)} barcodes (from barcodes.txt)")
 
-    # ---------- step 3: inspect label distribution BEFORE building dataset ----------
     def inspect_cell_distribution(
         self,
         min_cells_per_class: Optional[int] = None,
@@ -976,10 +939,7 @@ class GRNDatasetManager:
         save_plot: bool = True,
         plot_dir: Optional[str] = None
     ) -> pd.Series:
-        """
-        Reads labels_csv and intersects with feature barcodes.
-        Returns counts per class (after optional min/max filtering preview).
-        """
+    
         if self.common_barcodes is None:
             raise RuntimeError("Run load_feature_dir() first (need barcodes).")
 
@@ -993,7 +953,6 @@ class GRNDatasetManager:
         df[bc_col] = df[bc_col].astype(str)
         df[y_col]  = df[y_col].astype(str)
 
-        # keep only barcodes present in matrices
         in_feat = set(self.common_barcodes)
         df = df[df[bc_col].isin(in_feat)].copy()
 
@@ -1027,7 +986,6 @@ class GRNDatasetManager:
 
         return counts
 
-    # ---------- step 4: build dataset ----------
     def build_per_cell_dataset(self, prune: bool = True,
                                min_cells_per_class: Optional[int] = 50,
                                max_cells_per_class: Optional[int] = None) -> PerCellGraphDataset:
@@ -1040,7 +998,6 @@ class GRNDatasetManager:
         if self.paths.labels_csv is not None and self.labels_dict is None:
             self.inspect_cell_distribution(save_plot=False)
 
-        # unpack matrices
         tf_mat, tf_names, _ = self.mats["tf_feat"]
         gene_mat, gene_names, _ = self.mats["gene_feat"] 
         cells = self.common_barcodes
@@ -1077,7 +1034,6 @@ class GRNDatasetManager:
 
         return ds
     
-    # ---------- step 5: summarize dataset ----------
     def summarize_dataset(self, dataset, max_graphs=None, plot_dir=None, dpi=200):
         if plot_dir is None:
             plot_dir = os.path.join(self.paths.plots_dir, "dataset_summary")
@@ -1128,7 +1084,7 @@ class GRNDatasetManager:
 
         tf_edge_counts = []       
         target_edge_counts = []   
-        g2g_edge_counts = []      # only exists in rna_only graphs
+        g2g_edge_counts = []      
 
         tf_node_counts = []
         target_node_counts = []

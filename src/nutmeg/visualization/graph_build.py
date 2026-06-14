@@ -5,12 +5,19 @@ import pandas as pd
 from .utils import minmax_scale, normalize_peak_type
 
 
-def aggregate_edges(df: pd.DataFrame, style_config: dict) -> pd.DataFrame:
+def _is_rna_only(df: pd.DataFrame) -> bool:
+    return "_mode" in df.columns and (df["_mode"] == "rna_only").any() or \
+           df.get("cre_name", pd.Series(dtype=object)).isna().all()
+
+
+# ── Multiome: TF → CRE → Gene ─────────────────────────────────────────────────
+
+def aggregate_edges_multiome(df: pd.DataFrame, style_config: dict) -> pd.DataFrame:
     tf_cre = (
         df.groupby(["tf_name", "cre_name"], as_index=False)
         .agg(
-            support=("cell_freq", "sum"),
-            mean_attention_score=("mean_alpha_g2c", "mean"),
+            support=("cell_freq", "max"),
+            mean_attention_score=("mean_alpha_g2c", "mean") if "mean_alpha_g2c" in df.columns else ("cell_freq", "mean"),
             best_q_value=("q_value", "min"),
             n_paths=("gene_name", "size"),
         )
@@ -22,8 +29,8 @@ def aggregate_edges(df: pd.DataFrame, style_config: dict) -> pd.DataFrame:
     cre_gene = (
         df.groupby(["cre_name", "gene_name"], as_index=False)
         .agg(
-            support=("cell_freq", "sum"),
-            mean_attention_score=("mean_alpha_c2g", "mean"),
+            support=("cell_freq", "max"),
+            mean_attention_score=("mean_alpha_c2g", "mean") if "mean_alpha_c2g" in df.columns else ("cell_freq", "mean"),
             best_q_value=("q_value", "min"),
             n_paths=("tf_name", "size"),
         )
@@ -33,7 +40,31 @@ def aggregate_edges(df: pd.DataFrame, style_config: dict) -> pd.DataFrame:
     cre_gene["edge_type"] = "CRE_GENE"
 
     edges = pd.concat([tf_cre, cre_gene], ignore_index=True, sort=False)
+    return _scale_edges(edges, style_config)
 
+
+# ── RNA-only: TF → Gene ────────────────────────────────────────────────────────
+
+def aggregate_edges_rna_only(df: pd.DataFrame, style_config: dict) -> pd.DataFrame:
+    score_col = "mean_path_score" if "mean_path_score" in df.columns else "cell_freq"
+
+    tf_gene = (
+        df.groupby(["tf_name", "gene_name"], as_index=False)
+        .agg(
+            support=("cell_freq", "max"),
+            mean_attention_score=(score_col, "mean"),
+            best_q_value=("q_value", "min"),
+            n_paths=("tf_name", "size"),
+        )
+    )
+    tf_gene["source"] = tf_gene["tf_name"].astype(str)
+    tf_gene["target"] = tf_gene["gene_name"].astype(str)
+    tf_gene["edge_type"] = "TF_GENE"
+
+    return _scale_edges(tf_gene, style_config)
+
+
+def _scale_edges(edges: pd.DataFrame, style_config: dict) -> pd.DataFrame:
     edge_scale = style_config["size_scales"]["edges"]
     edges["edge_width"] = minmax_scale(
         edges["support"].fillna(0.0),
@@ -42,27 +73,38 @@ def aggregate_edges(df: pd.DataFrame, style_config: dict) -> pd.DataFrame:
     )
 
     edge_colors = {
-        "TF_CRE": style_config["edge_styles"]["TF_CRE"]["color"],
+        "TF_CRE":  style_config["edge_styles"]["TF_CRE"]["color"],
         "CRE_GENE": style_config["edge_styles"]["CRE_GENE"]["color"],
+        "TF_GENE": style_config["edge_styles"].get("TF_GENE", {}).get(
+            "color", style_config["defaults"]["fallback_edge_color"]
+        ),
     }
     edges["edge_color"] = edges["edge_type"].map(edge_colors).fillna(
         style_config["defaults"]["fallback_edge_color"]
     )
-
     return edges.reset_index(drop=True)
 
 
+def aggregate_edges(df: pd.DataFrame, style_config: dict) -> pd.DataFrame:
+    if _is_rna_only(df):
+        return aggregate_edges_rna_only(df, style_config)
+    return aggregate_edges_multiome(df, style_config)
+
+
+# ── Node builder ───────────────────────────────────────────────────────────────
+
 def build_nodes(
     df: pd.DataFrame,
-    peak_annot: pd.DataFrame,
+    peak_annot: pd.DataFrame | None,
     style_config: dict,
     edges: pd.DataFrame,
 ) -> pd.DataFrame:
-    tf_ids = set(df["tf_name"].astype(str).unique())
-    gene_ids = set(df["gene_name"].astype(str).unique())
-    cre_ids = set(df["cre_name"].astype(str).unique())
+    rna_only = _is_rna_only(df)
 
-    tf_nodes = pd.DataFrame({"id": sorted(tf_ids)})
+    tf_ids   = set(df["tf_name"].astype(str).unique())
+    gene_ids = set(df["gene_name"].astype(str).unique())
+
+    tf_nodes   = pd.DataFrame({"id": sorted(tf_ids)})
     tf_nodes["node_role"] = "TF"
     tf_nodes["node_type"] = "TF"
 
@@ -70,197 +112,101 @@ def build_nodes(
     gene_nodes["node_role"] = "Gene"
     gene_nodes["node_type"] = "Gene"
 
-    cre_nodes = pd.DataFrame({"id": sorted(cre_ids)})
-    cre_nodes["node_role"] = "CRE"
-    cre_nodes["node_type"] = "CRE"
+    if rna_only:
+        nodes = pd.concat([tf_nodes, gene_nodes], ignore_index=True)
+    else:
+        cre_ids  = set(df["cre_name"].dropna().astype(str).unique())
+        cre_nodes = pd.DataFrame({"id": sorted(cre_ids)})
+        cre_nodes["node_role"] = "CRE"
+        cre_nodes["node_type"] = "CRE"
+        nodes = pd.concat([tf_nodes, gene_nodes, cre_nodes], ignore_index=True)
 
-    nodes = pd.concat([tf_nodes, gene_nodes, cre_nodes], ignore_index=True)
     nodes = nodes.drop_duplicates(subset=["id"], keep="first")
     nodes["label"] = nodes["id"]
 
     dual_role_ids = tf_ids.intersection(gene_ids)
     nodes.loc[nodes["id"].isin(dual_role_ids), "node_role"] = "TF|Gene"
 
-    tf_support = (
-        df.groupby("tf_name", as_index=False)["cell_freq"]
-        .sum()
-        .rename(columns={"tf_name": "id", "cell_freq": "total_support"})
-    )
-    gene_support = (
-        df.groupby("gene_name", as_index=False)["cell_freq"]
-        .sum()
-        .rename(columns={"gene_name": "id", "cell_freq": "total_support"})
-    )
-    cre_support = (
-        df.groupby("cre_name", as_index=False)["cell_freq"]
-        .sum()
-        .rename(columns={"cre_name": "id", "cell_freq": "total_support"})
-    )
-
-    support = pd.concat([tf_support, gene_support, cre_support], ignore_index=True)
-    support = support.groupby("id", as_index=False)["total_support"].sum()
-
+    # Support aggregation
+    support_parts = [
+        df.groupby("tf_name",   as_index=False)["cell_freq"].mean().rename(columns={"tf_name":   "id", "cell_freq": "total_support"}),
+        df.groupby("gene_name", as_index=False)["cell_freq"].mean().rename(columns={"gene_name": "id", "cell_freq": "total_support"}),
+    ]
+    if not rna_only:
+        support_parts.append(
+            df.dropna(subset=["cre_name"]).groupby("cre_name", as_index=False)["cell_freq"].mean()
+            .rename(columns={"cre_name": "id", "cell_freq": "total_support"})
+        )
+    support = pd.concat(support_parts, ignore_index=True)
+    support = support.groupby("id", as_index=False)["total_support"].mean()
     nodes = nodes.merge(support, on="id", how="left")
     nodes["total_support"] = nodes["total_support"].fillna(0.0)
 
-    peak_map = peak_annot.rename(columns={"peak": "id"})[["id", "peak_type"]]
-    nodes = nodes.merge(peak_map, on="id", how="left")
-    nodes["peak_type"] = nodes["peak_type"].fillna("unknown").map(normalize_peak_type)
+    # Peak annotation (multiome only)
+    if not rna_only and peak_annot is not None:
+        peak_map = peak_annot.rename(columns={"peak": "id"})[["id", "peak_type"]]
+        nodes = nodes.merge(peak_map, on="id", how="left")
+    nodes["peak_type"] = nodes.get("peak_type", pd.Series("unknown", index=nodes.index)).fillna("unknown").map(normalize_peak_type)
 
-    tf_target_gene_counts = (
-        df.groupby("tf_name", as_index=False)["gene_name"]
-        .nunique()
-        .rename(columns={"tf_name": "id", "gene_name": "n_targets"})
-    )
+    # n_sources / n_targets
+    tf_targets = df.groupby("tf_name",   as_index=False)["gene_name"].nunique().rename(columns={"tf_name": "id",   "gene_name": "n_targets"})
+    gene_sources = df.groupby("gene_name", as_index=False)["tf_name"].nunique().rename(columns={"gene_name": "id", "tf_name": "n_sources"})
 
-    gene_source_tf_counts = (
-        df.groupby("gene_name", as_index=False)["tf_name"]
-        .nunique()
-        .rename(columns={"gene_name": "id", "tf_name": "n_sources"})
-    )
+    nodes = nodes.merge(tf_targets,    on="id", how="left")
+    nodes = nodes.merge(gene_sources,  on="id", how="left")
 
-    cre_source_tf_counts = (
-        df.groupby("cre_name", as_index=False)["tf_name"]
-        .nunique()
-        .rename(columns={"cre_name": "id", "tf_name": "n_sources"})
-    )
-
-    cre_target_gene_counts = (
-        df.groupby("cre_name", as_index=False)["gene_name"]
-        .nunique()
-        .rename(columns={"cre_name": "id", "gene_name": "n_targets"})
-    )
-
-    dual_source_tf_counts = (
-        df[df["gene_name"].astype(str).isin(dual_role_ids)]
-        .groupby("gene_name", as_index=False)["tf_name"]
-        .nunique()
-        .rename(columns={"gene_name": "id", "tf_name": "dual_n_sources"})
-    )
-
-    dual_target_gene_counts = (
-        df[df["tf_name"].astype(str).isin(dual_role_ids)]
-        .groupby("tf_name", as_index=False)["gene_name"]
-        .nunique()
-        .rename(columns={"tf_name": "id", "gene_name": "dual_n_targets"})
-    )
-
-    nodes = nodes.merge(tf_target_gene_counts, on="id", how="left")
-    nodes = nodes.merge(gene_source_tf_counts, on="id", how="left")
-    nodes = nodes.merge(cre_source_tf_counts, on="id", how="left", suffixes=("", "_cre"))
-    nodes = nodes.merge(cre_target_gene_counts, on="id", how="left", suffixes=("", "_cre_target"))
-    nodes = nodes.merge(dual_source_tf_counts, on="id", how="left")
-    nodes = nodes.merge(dual_target_gene_counts, on="id", how="left")
-
-    nodes["n_sources"] = nodes["n_sources"].fillna(0)
-    nodes["n_targets"] = nodes["n_targets"].fillna(0)
-
-    cre_source_mask = nodes["node_role"] == "CRE"
-    cre_target_mask = nodes["node_role"] == "CRE"
-    dual_mask = nodes["node_role"] == "TF|Gene"
-
-    if "n_sources_cre" in nodes.columns:
-        nodes.loc[cre_source_mask, "n_sources"] = nodes.loc[cre_source_mask, "n_sources_cre"].fillna(0)
-
-    if "n_targets_cre_target" in nodes.columns:
-        nodes.loc[cre_target_mask, "n_targets"] = nodes.loc[cre_target_mask, "n_targets_cre_target"].fillna(0)
-
-    nodes.loc[dual_mask, "n_sources"] = nodes.loc[dual_mask, "dual_n_sources"].fillna(
-        nodes.loc[dual_mask, "n_sources"]
-    )
-    nodes.loc[dual_mask, "n_targets"] = nodes.loc[dual_mask, "dual_n_targets"].fillna(
-        nodes.loc[dual_mask, "n_targets"]
-    )
+    if not rna_only:
+        cre_src  = df.dropna(subset=["cre_name"]).groupby("cre_name", as_index=False)["tf_name"].nunique().rename(columns={"cre_name": "id", "tf_name": "n_sources_cre"})
+        cre_tgt  = df.dropna(subset=["cre_name"]).groupby("cre_name", as_index=False)["gene_name"].nunique().rename(columns={"cre_name": "id", "gene_name": "n_targets_cre"})
+        nodes = nodes.merge(cre_src, on="id", how="left")
+        nodes = nodes.merge(cre_tgt, on="id", how="left")
+        cre_mask = nodes["node_role"] == "CRE"
+        nodes.loc[cre_mask, "n_sources"] = nodes.loc[cre_mask, "n_sources_cre"].fillna(0)
+        nodes.loc[cre_mask, "n_targets"] = nodes.loc[cre_mask, "n_targets_cre"].fillna(0)
+        nodes = nodes.drop(columns=[c for c in ["n_sources_cre", "n_targets_cre"] if c in nodes.columns])
 
     nodes["n_sources"] = nodes["n_sources"].fillna(0).astype(int)
     nodes["n_targets"] = nodes["n_targets"].fillna(0).astype(int)
 
-    drop_cols = [
-        "n_sources_cre",
-        "n_targets_cre_target",
-        "dual_n_sources",
-        "dual_n_targets",
-    ]
-    drop_cols = [c for c in drop_cols if c in nodes.columns]
-    if drop_cols:
-        nodes = nodes.drop(columns=drop_cols)
-
+    # Styles
     node_styles = style_config["node_styles"]
-    default_border_color = style_config["defaults"]["border_color"]
-    default_border_width = style_config["defaults"]["border_width"]
-    dual_role_border_width = style_config["defaults"].get("dual_role_border_width", 4)
-    node_scale = style_config["size_scales"]["nodes"]
+    defaults    = style_config["defaults"]
+    node_scale  = style_config["size_scales"]["nodes"]
 
-    nodes["node_shape"] = node_styles["Gene"]["shape"]
-    nodes.loc[nodes["node_type"] == "TF", "node_shape"] = node_styles["TF"]["shape"]
-    nodes.loc[nodes["node_type"] == "CRE", "node_shape"] = node_styles["CRE_unknown"]["shape"]
+    nodes["node_shape"]        = node_styles["Gene"]["shape"]
+    nodes["node_fill_color"]   = node_styles["Gene"]["color"]
+    nodes["node_border_color"] = defaults["border_color"]
+    nodes["node_border_width"] = defaults["border_width"]
+
+    tf_mask   = nodes["node_role"].isin(["TF", "TF|Gene"])
+    dual_mask = nodes["node_role"] == "TF|Gene"
+    gene_mask = nodes["node_role"] == "Gene"
+
+    nodes.loc[tf_mask,   "node_shape"]        = node_styles["TF"]["shape"]
+    nodes.loc[tf_mask,   "node_fill_color"]   = node_styles["TF"]["color"]
+    nodes.loc[tf_mask,   "node_border_color"] = node_styles["TF"].get("border_color", defaults["border_color"])
+    nodes.loc[tf_mask,   "node_border_width"] = node_styles["TF"].get("border_width", defaults["border_width"])
+
+    nodes.loc[gene_mask, "node_border_color"] = node_styles["Gene"].get("border_color", defaults["border_color"])
+    nodes.loc[gene_mask, "node_border_width"] = node_styles["Gene"].get("border_width", defaults["border_width"])
+
+    nodes.loc[dual_mask, "node_border_color"] = node_styles["Gene"]["color"]
+    nodes.loc[dual_mask, "node_border_width"] = defaults.get("dual_role_border_width", 4)
+
+    if not rna_only:
+        cre_mask_p = (nodes["node_role"] == "CRE") & (nodes["peak_type"] == "promoter")
+        cre_mask_d = (nodes["node_role"] == "CRE") & (nodes["peak_type"] == "distal")
+        cre_mask_u = (nodes["node_role"] == "CRE") & (~nodes["peak_type"].isin(["promoter", "distal"]))
+
+        for mask, key in [(cre_mask_p, "CRE_promoter"), (cre_mask_d, "CRE_distal"), (cre_mask_u, "CRE_unknown")]:
+            nodes.loc[mask, "node_shape"]        = node_styles[key]["shape"]
+            nodes.loc[mask, "node_fill_color"]   = node_styles[key]["color"]
+            nodes.loc[mask, "node_border_color"] = node_styles[key].get("border_color", defaults["border_color"])
+            nodes.loc[mask, "node_border_width"] = node_styles[key].get("border_width", defaults["border_width"])
 
     nodes["display_label"] = nodes["label"]
-    if not style_config["layout"].get("show_cre_labels", False):
+    if not rna_only and not style_config["layout"].get("show_cre_labels", False):
         nodes.loc[nodes["node_type"] == "CRE", "display_label"] = ""
-
-    nodes["node_fill_color"] = node_styles["Gene"]["color"]
-    nodes.loc[nodes["node_role"].isin(["TF", "TF|Gene"]), "node_fill_color"] = node_styles["TF"]["color"]
-
-    nodes.loc[
-        (nodes["node_role"] == "CRE") & (nodes["peak_type"] == "promoter"),
-        "node_fill_color"
-    ] = node_styles["CRE_promoter"]["color"]
-    nodes.loc[
-        (nodes["node_role"] == "CRE") & (nodes["peak_type"] == "distal"),
-        "node_fill_color"
-    ] = node_styles["CRE_distal"]["color"]
-    nodes.loc[
-        (nodes["node_role"] == "CRE") & (~nodes["peak_type"].isin(["promoter", "distal"])),
-        "node_fill_color"
-    ] = node_styles["CRE_unknown"]["color"]
-
-    nodes["node_border_color"] = default_border_color
-    nodes["node_border_width"] = default_border_width
-
-    nodes.loc[nodes["node_role"] == "TF", "node_border_color"] = node_styles["TF"].get(
-        "border_color", default_border_color
-    )
-    nodes.loc[nodes["node_role"] == "TF", "node_border_width"] = node_styles["TF"].get(
-        "border_width", default_border_width
-    )
-
-    nodes.loc[nodes["node_role"] == "Gene", "node_border_color"] = node_styles["Gene"].get(
-        "border_color", default_border_color
-    )
-    nodes.loc[nodes["node_role"] == "Gene", "node_border_width"] = node_styles["Gene"].get(
-        "border_width", default_border_width
-    )
-
-    nodes.loc[nodes["node_role"] == "TF|Gene", "node_border_color"] = node_styles["Gene"]["color"]
-    nodes.loc[nodes["node_role"] == "TF|Gene", "node_border_width"] = dual_role_border_width
-
-    nodes.loc[
-        (nodes["node_role"] == "CRE") & (nodes["peak_type"] == "promoter"),
-        "node_border_color"
-    ] = node_styles["CRE_promoter"].get("border_color", default_border_color)
-    nodes.loc[
-        (nodes["node_role"] == "CRE") & (nodes["peak_type"] == "promoter"),
-        "node_border_width"
-    ] = node_styles["CRE_promoter"].get("border_width", default_border_width)
-
-    nodes.loc[
-        (nodes["node_role"] == "CRE") & (nodes["peak_type"] == "distal"),
-        "node_border_color"
-    ] = node_styles["CRE_distal"].get("border_color", default_border_color)
-    nodes.loc[
-        (nodes["node_role"] == "CRE") & (nodes["peak_type"] == "distal"),
-        "node_border_width"
-    ] = node_styles["CRE_distal"].get("border_width", default_border_width)
-
-    nodes.loc[
-        (nodes["node_role"] == "CRE") & (~nodes["peak_type"].isin(["promoter", "distal"])),
-        "node_border_color"
-    ] = node_styles["CRE_unknown"].get("border_color", default_border_color)
-    nodes.loc[
-        (nodes["node_role"] == "CRE") & (~nodes["peak_type"].isin(["promoter", "distal"])),
-        "node_border_width"
-    ] = node_styles["CRE_unknown"].get("border_width", default_border_width)
 
     nodes["node_size"] = minmax_scale(
         nodes["total_support"].fillna(0.0),

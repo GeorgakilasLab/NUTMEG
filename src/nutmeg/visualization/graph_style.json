@@ -38,12 +38,16 @@
   },
   "edge_styles": {
     "TF_CRE": {
-      "label": "TF → CRE",
+      "label": "TF \u2192 CRE",
       "color": "#9ECAE1"
     },
     "CRE_GENE": {
-      "label": "CRE → Gene",
+      "label": "CRE \u2192 Gene",
       "color": "#969696"
+    },
+    "TF_GENE": {
+      "label": "TF \u2192 Gene",
+      "color": "#E8A838"
     }
   },
   "legend_sizes": {
@@ -86,7 +90,12 @@
     "opacity": 0.7
   },
   "layout": {
-    "available_layouts": ["cose", "concentric", "breadthfirst", "circle"],
+    "available_layouts": [
+      "cose",
+      "concentric",
+      "breadthfirst",
+      "circle"
+    ],
     "default_layout": "cose",
     "widget_width": "100%",
     "widget_height": "520px",
