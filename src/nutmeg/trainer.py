@@ -86,14 +86,17 @@ class NUTMEGTrainer:
 
         self.log_path = self.train_dir / "train.log.txt"
 
+        # scalers
         self.scaler_tf = StandardScaler()
         self.scaler_gene = StandardScaler()
         self.scaler_cre = StandardScaler()
 
+        # objects
         self.model = None
         self.criterion = None
         self.optimizer = None
 
+        # tracking
         self.history = []
         self.best_state_dict = None
         self.best_epoch = -1
@@ -157,7 +160,7 @@ class NUTMEGTrainer:
         self._log(f"[init] num_genes={self._infer_num_genes()} (num_classes initial={num_classes})")
     
     # --------------------------
-    # Scalers 
+    # Scalers (fit on a dataset)
     # --------------------------
     def fit_scalers(self, train_ds):
         X_tf_list, X_gene_list, X_cre_list = [], [], []
@@ -392,17 +395,17 @@ class NUTMEGTrainer:
         axes[1].legend()
 
         fig.tight_layout()
-        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        fig.savefig(out_path)
         plt.close(fig)
 
     def _save_confusion_matrix_plot(self, y_true, y_pred, out_path: Path, title: str, labels, display_labels):
         cm = confusion_matrix(y_true, y_pred, labels=labels)
         disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=display_labels)
-        fig, ax = plt.subplots(figsize=(6, 5))
+        fig, ax = plt.subplots(figsize=(10, 8))
         disp.plot(ax=ax, cmap="Blues", colorbar=True, xticks_rotation=45)
         ax.set_title(title)
         fig.tight_layout()
-        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        fig.savefig(out_path)
         plt.close(fig)
 
     # --------------------------
@@ -427,6 +430,7 @@ class NUTMEGTrainer:
         # build loss/opt using internal train subset
         self._build_criterion_optimizer(tr_ds)
 
+        # materialize
         tr_graphs = self._materialize_graphs_from_ds(tr_ds)
         va_graphs = self._materialize_graphs_from_ds(va_ds)
 
@@ -543,6 +547,11 @@ class NUTMEGTrainer:
 
     @torch.no_grad()
     def evaluate(self, test_ds):
+        """
+        Input: test_ds (Subset or Dataset)
+        Output folder:
+        - plots/<run_id>/ : classification report, confusion matrix, test metrics, per-class metrics plot
+        """
         bs = int(self.cfg["train"].get("train_batch_size", 64))
 
         test_graphs = self._materialize_graphs_from_ds(test_ds)
@@ -587,12 +596,15 @@ class NUTMEGTrainer:
             display_labels=target_names
         )
 
+        # per-class metrics 
         per_class_path = self.plots_dir / "per_class_metrics.png"
         self._save_per_class_metrics_plot(rep_dict, per_class_path, title="Per-class metrics")
 
         test_metrics = {
             "run_id": self.run_id,
             "n_test": int(len(test_ds)),
+            "y_true": m["y_true"].tolist(),
+            "y_pred": m["y_pred"].tolist(),
             "test_loss": float(m["loss"]),
             "test_accuracy": float(m["accuracy"]),
             "test_bal_acc": float(m["bal_acc"]),
@@ -608,4 +620,6 @@ class NUTMEGTrainer:
         (self.plots_dir / "test_metrics.json").write_text(json.dumps(test_metrics, indent=2), encoding="utf-8")
 
         self._log(f"[eval] saved plots to {self.plots_dir}")
-        return test_metrics
+
+
+        return test_metrics 

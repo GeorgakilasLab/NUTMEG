@@ -50,25 +50,26 @@
       "color": "#E8A838"
     }
   },
-  "legend_sizes": {
-    "node_icon": 16,
-    "node_small": 10,
-    "node_large": 20,
-    "edge_width": 4,
-    "edge_small": 2,
-    "edge_large": 5,
-    "edge_length": 28,
-    "line_width_px": 28
-  },
   "size_scales": {
-    "nodes": {
-      "min": 16,
-      "max": 42
+    "labeled_nodes": {
+      "size": null,
+      "comment": "null = derive from longest label at runtime. Set a number to override."
+    },
+    "cre_nodes": {
+      "size": 28
     },
     "edges": {
       "min": 2,
       "max": 6
     }
+  },
+  "legend_sizes": {
+    "node_icon": 16,
+    "edge_width": 4,
+    "edge_small": 2,
+    "edge_large": 5,
+    "edge_length": 28,
+    "line_width_px": 28
   },
   "defaults": {
     "border_color": "#111111",
@@ -81,8 +82,10 @@
     "node_text_color": "#000000",
     "text_valign": "center",
     "text_halign": "center",
-    "text_wrap": "wrap",
-    "text_max_width": 100
+    "text_wrap": "none",
+    "text_max_width": null,
+    "label_padding": 5,
+    "char_width_ratio": 0.62
   },
   "edges": {
     "curve_style": "bezier",
@@ -100,7 +103,13 @@
     "widget_width": "100%",
     "widget_height": "520px",
     "container_height": "auto",
-    "show_cre_labels": false
+    "show_cre_labels": false,
+    "cose_options": {
+      "idealEdgeLength": 150,
+      "nodeRepulsion": 8000,
+      "nodeOverlap": 20,
+      "padding": 30
+    }
   },
   "controls": {
     "class_width": "220px",

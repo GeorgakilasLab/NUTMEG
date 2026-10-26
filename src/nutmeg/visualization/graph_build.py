@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from .utils import minmax_scale, normalize_peak_type
@@ -127,20 +128,24 @@ def build_nodes(
     dual_role_ids = tf_ids.intersection(gene_ids)
     nodes.loc[nodes["id"].isin(dual_role_ids), "node_role"] = "TF|Gene"
 
-    # Support aggregation
+    # Path-level support rolled up per node.
     support_parts = [
-        df.groupby("tf_name",   as_index=False)["cell_freq"].mean().rename(columns={"tf_name":   "id", "cell_freq": "total_support"}),
-        df.groupby("gene_name", as_index=False)["cell_freq"].mean().rename(columns={"gene_name": "id", "cell_freq": "total_support"}),
+        df.groupby("tf_name",   as_index=False)["cell_freq"].max().rename(columns={"tf_name":   "id", "cell_freq": "max_path_cell_freq"}),
+        df.groupby("gene_name", as_index=False)["cell_freq"].max().rename(columns={"gene_name": "id", "cell_freq": "max_path_cell_freq"}),
     ]
     if not rna_only:
         support_parts.append(
-            df.dropna(subset=["cre_name"]).groupby("cre_name", as_index=False)["cell_freq"].mean()
-            .rename(columns={"cre_name": "id", "cell_freq": "total_support"})
+            df.dropna(subset=["cre_name"]).groupby("cre_name", as_index=False)["cell_freq"].max()
+            .rename(columns={"cre_name": "id", "cell_freq": "max_path_cell_freq"})
         )
     support = pd.concat(support_parts, ignore_index=True)
-    support = support.groupby("id", as_index=False)["total_support"].mean()
+    support = support.groupby("id", as_index=False)["max_path_cell_freq"].max()
+
+    nodes["id"] = nodes["id"].astype(str)
+    support["id"] = support["id"].astype(str)
+
     nodes = nodes.merge(support, on="id", how="left")
-    nodes["total_support"] = nodes["total_support"].fillna(0.0)
+    nodes["max_path_cell_freq"] = nodes["max_path_cell_freq"].fillna(0.0)
 
     # Peak annotation (multiome only)
     if not rna_only and peak_annot is not None:
@@ -171,7 +176,7 @@ def build_nodes(
     # Styles
     node_styles = style_config["node_styles"]
     defaults    = style_config["defaults"]
-    node_scale  = style_config["size_scales"]["nodes"]
+    size_scales = style_config["size_scales"]
 
     nodes["node_shape"]        = node_styles["Gene"]["shape"]
     nodes["node_fill_color"]   = node_styles["Gene"]["color"]
@@ -208,10 +213,27 @@ def build_nodes(
     if not rna_only and not style_config["layout"].get("show_cre_labels", False):
         nodes.loc[nodes["node_type"] == "CRE", "display_label"] = ""
 
-    nodes["node_size"] = minmax_scale(
-        nodes["total_support"].fillna(0.0),
-        node_scale["min"],
-        node_scale["max"],
-    )
+    # ── Node size ─────────────────────────────────────────────────────────────
+    text_cfg = style_config["text"]
+    font_px  = float(text_cfg["node_font_size"])
+    pad      = float(text_cfg.get("label_padding", 5))
+    char_w   = float(text_cfg.get("char_width_ratio", 0.62))
+
+    def fit_diameter(labels: pd.Series) -> float:
+        n = int(labels.fillna("").str.len().max() or 0)
+        if n == 0:
+            return 2.0 * pad
+        return float(np.hypot(n * font_px * char_w, font_px)) + 2.0 * pad
+
+    labeled = nodes["node_type"].isin(["TF", "Gene"])
+
+    lab_size = size_scales.get("labeled_nodes", {}).get("size")
+    if lab_size is None:
+        lab_size = fit_diameter(nodes.loc[labeled, "display_label"])
+    lab_size = float(lab_size)
+
+    cre_size = float(size_scales.get("cre_nodes", {}).get("size", 28))
+
+    nodes["node_size"] = np.where(nodes["node_type"] == "CRE", cre_size, lab_size)
 
     return nodes.reset_index(drop=True)

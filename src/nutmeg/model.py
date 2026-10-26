@@ -36,6 +36,7 @@ class NUTMEG(nn.Module):
         self.act  = nn.ELU()
         self.drop = nn.Dropout(dropout) if (dropout is not None and dropout > 0) else nn.Identity()
 
+        # Residual projections 
         self.proj_gene_in = Linear(-1, hidden_dim, bias=False)
 
         if mode == "multiome":
@@ -55,7 +56,7 @@ class NUTMEG(nn.Module):
         
         self.norm_gene = nn.LayerNorm(hidden_dim)
 
-        # -------- Per-gene MLP projector --------
+        # -------- Per-gene MLP projector: [H(+1)] -> 1 --------
         in_dim = hidden_dim + (1 if include_presence_bit else 0)
         self.per_gene_mlp = nn.Sequential(
             nn.LayerNorm(in_dim),
@@ -65,10 +66,11 @@ class NUTMEG(nn.Module):
             nn.Linear(per_gene_hidden, 1, bias=True),
         )
 
-        # -------- Classifier over genes: --------
+        # -------- Classifier over genes: [G] -> [C] --------
         self.classifier = Linear(self.G, self.C, bias=True)
 
 
+    # scatter to [B,G,H]
     def _dense_scatter_embeddings(self, x: torch.Tensor, b: torch.Tensor, gidx: torch.Tensor, B: int):
         N, H = x.size(0), x.size(1)
         out_flat = x.new_zeros(B * self.G * H)                  
@@ -79,10 +81,11 @@ class NUTMEG(nn.Module):
         return out_flat.view(B, self.G, H)                      
     
     def forward(self, data):
-        
+        # Node features
         tf_feats   = data['gene'].tf_feats.float()
         gene_feats = data['gene'].gene_feats.float()
         
+        # Batch ids
         gene_batch = getattr(data['gene'], 'batch', None)
         if gene_batch is None or gene_batch.numel() == 0:
             gene_batch = torch.zeros(gene_x.size(0), dtype=torch.long, device=gene_x.device)

@@ -40,8 +40,6 @@ def make_legend_panel(style_config, rna_only: bool = False):
     defaults     = style_config["defaults"]
 
     node_icon  = legend_sizes.get("node_icon", 18)
-    node_small = legend_sizes.get("node_small", 12)
-    node_large = legend_sizes.get("node_large", 24)
     edge_width = legend_sizes.get("edge_width", 4)
     edge_small = legend_sizes.get("edge_small", 2)
     edge_large = legend_sizes.get("edge_large", 5)
@@ -60,7 +58,7 @@ def make_legend_panel(style_config, rna_only: bool = False):
              ns["Gene"].get("label", "Gene")),
 
         _row(_circle(ns["TF"]["color"], ns["Gene"]["color"], node_icon, dual_bw),
-             "TF | Gene (dual role)"),
+             "TF | Gene"),
     ]
 
     # CRE node types — multiome only
@@ -83,9 +81,6 @@ def make_legend_panel(style_config, rna_only: bool = False):
         ]
 
     children += [
-        widgets.HTML("<div style='font-weight:bold; margin:12px 0 8px 0;'>Node size</div>"),
-        _row(_circle("#999999", "#999999", node_small, 0), "Lower total support"),
-        _row(_circle("#999999", "#999999", node_large, 0), "Higher total support"),
         widgets.HTML("<div style='font-weight:bold; margin:12px 0 8px 0;'>Edges</div>"),
     ]
 
@@ -105,8 +100,8 @@ def make_legend_panel(style_config, rna_only: bool = False):
 
     children += [
         widgets.HTML("<div style='font-weight:bold; margin:12px 0 8px 0;'>Edge size</div>"),
-        _row(_line("#666666", edge_small, edge_length), "Lower total support"),
-        _row(_line("#666666", edge_large, edge_length), "Higher total support"),
+        _row(_line("#666666", edge_small, edge_length), "Lower cell frequency"),
+        _row(_line("#666666", edge_large, edge_length), "Higher cell frequency"),
     ]
 
     return widgets.VBox(

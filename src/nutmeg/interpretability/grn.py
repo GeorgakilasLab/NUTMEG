@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from .collect import _forward_graphs_to_cells
 from .utils import (
@@ -432,6 +433,34 @@ def _prepare_grn_jobs(
     return jobs, model_mode
 
 
+def _aggregate_perm_result(model_mode, perm_cells, top_k_per_cell, min_cells, path_score):
+    if model_mode == "rna_only":
+        return aggregate_t2g_by_cells(
+            perm_cells,
+            top_k_per_cell=top_k_per_cell,
+            min_cells=min_cells,
+        )
+    return aggregate_paths_by_cells(
+        perm_cells,
+        top_k_per_cell=top_k_per_cell,
+        min_cells=min_cells,
+        path_score=path_score,
+    )
+
+
+def _reduce_single_slice(args):
+    model_mode, perm_cells, top_k_per_cell, min_cells, path_score, key_cols, candidate_df, stat_col = args
+    perm_df = _aggregate_perm_result(model_mode, perm_cells, top_k_per_cell, min_cells, path_score)
+    perm_df = _filter_df_to_candidate_keys(
+        perm_df,
+        key_cols,
+        _candidate_key_set(candidate_df, key_cols),
+    )
+    acc = _init_perm_accumulator(_candidate_key_set(candidate_df, key_cols))
+    _update_perm_accumulator(acc, perm_df, key_cols, stat_col)
+    return acc
+
+
 def _run_hybrid_permutation_stage(
     runner,
     ds,
@@ -447,6 +476,7 @@ def _run_hybrid_permutation_stage(
     permutation_batch_size,
     candidate_field,
     accumulator_field,
+    n_jobs=1,
 ):
     n_permutations = int(n_permutations)
     if n_permutations <= 0:
@@ -463,6 +493,7 @@ def _run_hybrid_permutation_stage(
     rng = np.random.default_rng(int(random_seed))
     perm_ids = list(range(n_permutations))
     permutation_batch_size = max(1, int(permutation_batch_size))
+    n_jobs = max(1, int(n_jobs))
 
     for start in range(0, len(perm_ids), permutation_batch_size):
         perm_chunk = perm_ids[start:start + permutation_batch_size]
@@ -507,30 +538,74 @@ def _run_hybrid_permutation_stage(
             forward_batch_size=forward_batch_size,
         )
 
+        work_items = []
         for sl in slices:
             job = job_map[sl["class_key"]]
             perm_cells = perm_cells_all[sl["start"]:sl["stop"]]
-
-            if model_mode == "rna_only":
-                perm_df = aggregate_t2g_by_cells(
+            work_items.append((
+                sl["class_key"],
+                _reduce_single_slice,
+                (
+                    model_mode,
                     perm_cells,
-                    top_k_per_cell=top_k_per_cell,
-                    min_cells=min_cells,
-                )
-            else:
-                perm_df = aggregate_paths_by_cells(
-                    perm_cells,
-                    top_k_per_cell=top_k_per_cell,
-                    min_cells=min_cells,
-                    path_score=path_score,
-                )
+                    top_k_per_cell,
+                    min_cells,
+                    path_score,
+                    job["key_cols"],
+                    job[candidate_field],
+                    job["stat_col"],
+                ),
+            ))
 
-            perm_df = _filter_df_to_candidate_keys(
-                perm_df,
-                job["key_cols"],
-                _candidate_key_set(job[candidate_field], job["key_cols"]),
-            )
-            _update_perm_accumulator(job[accumulator_field], perm_df, job["key_cols"], job["stat_col"])
+        if n_jobs > 1 and len(work_items) > 1:
+            with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+                future_map = {
+                    ex.submit(fn, args): class_key
+                    for class_key, fn, args in work_items
+                }
+                for fut in as_completed(future_map):
+                    class_key = future_map[fut]
+                    acc_part = fut.result()
+                    job = job_map[class_key]
+                    merged = _merge_perm_accumulators(job[accumulator_field], acc_part)
+                    job[accumulator_field] = merged
+        else:
+            for class_key, fn, args in work_items:
+                acc_part = fn(args)
+                job = job_map[class_key]
+                merged = _merge_perm_accumulators(job[accumulator_field], acc_part)
+                job[accumulator_field] = merged
+
+
+def _observed_only_result(model_mode, c, observed, stat_col, q_value_threshold, n_permutations, forward_batch_size, permutation_batch_size):
+    observed = observed.copy()
+    observed["null_mean"] = 0.0
+    observed["null_std"] = 0.0
+    observed["p_value"] = 1.0
+    observed["q_value"] = 1.0
+    if model_mode == "rna_only":
+        return {
+            "mode": "rna_only",
+            "class_name": c,
+            "significant_edges": observed,
+            "regulators": top_regulators_from_t2g(observed),
+            "n_permutations": int(n_permutations),
+            "q_value_threshold": float(q_value_threshold),
+            "stat_col": stat_col,
+            "forward_batch_size": int(forward_batch_size),
+            "permutation_batch_size": int(permutation_batch_size),
+        }
+    return {
+        "mode": "multiome",
+        "class_name": c,
+        "significant_paths": observed,
+        "regulators": top_regulators_from_paths(observed),
+        "n_permutations": int(n_permutations),
+        "q_value_threshold": float(q_value_threshold),
+        "stat_col": stat_col,
+        "forward_batch_size": int(forward_batch_size),
+        "permutation_batch_size": int(permutation_batch_size),
+    }
 
 
 def significant_grn_all_classes_batched(
@@ -549,6 +624,7 @@ def significant_grn_all_classes_batched(
     forward_batch_size=64,
     permutation_batch_size=8,
     all_graphs=None,
+    n_jobs=1,
 ):
     if all_graphs is None:
         all_graphs = runner._materialize_graphs_from_ds(ds)
@@ -565,7 +641,43 @@ def significant_grn_all_classes_batched(
 
     total_perm = int(n_permutations)
     if total_perm <= 0:
-        total_perm = 1
+        out = {}
+        for job in jobs:
+            c = job["class_name"]
+            ckey = job["class_key"]
+            observed = job["observed"]
+            stat_col = job["stat_col"]
+            if observed is None or len(observed) == 0:
+                if model_mode == "rna_only":
+                    out[ckey] = {
+                        "mode": "rna_only",
+                        "class_name": c,
+                        "significant_edges": pd.DataFrame(),
+                        "regulators": top_regulators_from_t2g(pd.DataFrame()),
+                        "n_permutations": int(n_permutations),
+                        "q_value_threshold": float(q_value_threshold),
+                        "stat_col": stat_col,
+                        "forward_batch_size": int(forward_batch_size),
+                        "permutation_batch_size": int(permutation_batch_size),
+                    }
+                else:
+                    out[ckey] = {
+                        "mode": "multiome",
+                        "class_name": c,
+                        "significant_paths": pd.DataFrame(),
+                        "regulators": top_regulators_from_paths(pd.DataFrame()),
+                        "n_permutations": int(n_permutations),
+                        "q_value_threshold": float(q_value_threshold),
+                        "stat_col": stat_col,
+                        "forward_batch_size": int(forward_batch_size),
+                        "permutation_batch_size": int(permutation_batch_size),
+                    }
+            else:
+                out[ckey] = _observed_only_result(
+                    model_mode, c, observed, stat_col, q_value_threshold,
+                    n_permutations, forward_batch_size, permutation_batch_size,
+                )
+        return out
 
     screening_permutations = min(32, max(16, total_perm // 4)) if total_perm >= 16 else max(1, total_perm // 2)
     refinement_permutations = max(1, total_perm - screening_permutations)
@@ -621,6 +733,7 @@ def significant_grn_all_classes_batched(
         permutation_batch_size=permutation_batch_size,
         candidate_field="candidate_observed",
         accumulator_field="screening_accumulator",
+        n_jobs=n_jobs,
     )
 
     for job in jobs:
@@ -658,6 +771,7 @@ def significant_grn_all_classes_batched(
         permutation_batch_size=permutation_batch_size,
         candidate_field="refinement_observed",
         accumulator_field="refinement_accumulator",
+        n_jobs=n_jobs,
     )
 
     out = {}
@@ -762,6 +876,7 @@ def significant_class_grn(
     forward_batch_size=64,
     permutation_batch_size=8,
     all_graphs=None,
+    n_jobs=1,
 ):
     out = significant_grn_all_classes_batched(
         runner,
@@ -778,5 +893,6 @@ def significant_class_grn(
         forward_batch_size=forward_batch_size,
         permutation_batch_size=permutation_batch_size,
         all_graphs=all_graphs,
+        n_jobs=n_jobs,
     )
     return out[str(c)]
