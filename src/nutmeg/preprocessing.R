@@ -365,6 +365,10 @@ GRNPrep <- R6Class(
       if (!file.exists(self$tenx_h5_path)) stop("[load] tenx_h5_path not found: ", self$tenx_h5_path)
 
       counts <- Read10X_h5(self$tenx_h5_path)
+      if (!is.list(counts)) {
+        message("[load] Single feature type detected; treating matrix as Gene Expression.")
+        counts <- list("Gene Expression" = counts)
+      }
       rna_counts <- counts$`Gene Expression`
       obj <- CreateSeuratObject(counts = rna_counts, assay = "RNA")
 
