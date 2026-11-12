@@ -1,1210 +1,736 @@
 from __future__ import annotations
 
-import os
-import glob
-from pathlib import Path
+import json
+from collections import defaultdict
 from dataclasses import dataclass
-from collections import defaultdict, Counter
-from typing import Dict, Optional, Tuple, List, Any, Set
+from pathlib import Path
+import os
+import matplotlib.pyplot as plt
+from typing import Dict, Optional, Tuple, List, Any
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 from torch_geometric.data import HeteroData
 from sklearn.model_selection import train_test_split
-from torch.utils.data import Subset
-
-import matplotlib.pyplot as plt
-from scipy.io import mmread
 
 
-# ============================================================
-# 1) Base GRN 
-# ============================================================
+
+
+
+def _read(path):
+    if not Path(path).is_file():
+        raise FileNotFoundError(path)
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
+
+
+def _require(df, columns, source):
+    missing = set(columns) - set(df.columns)
+    if missing:
+        raise ValueError(f"{source} missing columns: {sorted(missing)}")
+
+
+def _ids(df, columns, source):
+    for col in columns:
+        df[col] = df[col].str.strip()
+        if df[col].eq("").any():
+            raise ValueError(f"{source}: empty {col}")
+
+
+def _direction(value):
+    token = str(value).strip().lower()
+    if token in {"true", "1", "t"}:
+        return True
+    if token in {"false", "0", "f"}:
+        return False
+    raise ValueError(f"Invalid is_directional: {value!r}")
+
+
+def _features(names, values, context):
+
+    names = str(names).strip()
+    values = str(values).strip()
+    try:
+        ns = json.loads(names) if names.startswith("[") else [names]
+        vs = json.loads(values) if values.startswith("[") else [float(values)]
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid JSON feature list: {context}") from exc
+    if not isinstance(ns, list) or not isinstance(vs, list) or not ns or len(ns) != len(vs):
+        raise ValueError(f"Feature lists must be nonempty and equal length: {context}")
+    if any(not isinstance(n, str) or not n.strip() for n in ns):
+        raise ValueError(f"Feature names must be nonempty strings: {context}")
+    if len(set(ns)) != len(ns):
+        raise ValueError(f"Duplicate feature name: {context}")
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in vs):
+        raise ValueError(f"Feature values must be numeric: {context}")
+    arr = np.asarray(vs, dtype=np.float64)
+    if not np.isfinite(arr).all() or (np.abs(arr) > np.finfo(np.float32).max).any():
+        raise ValueError(f"Nonfinite or out-of-range feature value: {context}")
+    return ns, arr.astype(np.float32).tolist()
+
+
+def _nodes(path):
+    df = _read(path)
+    _require(df, ["node_id", "node_type", "node_subtype", "feature_name", "feature_value", "metadata_id"], "node.csv")
+    if df.empty:
+        raise ValueError("node.csv is empty")
+    _ids(df, ["node_id", "node_type", "metadata_id"], "node.csv")
+    df["node_subtype"] = df["node_subtype"].str.strip()
+    if df.duplicated(["metadata_id", "node_id"]).any():
+        raise ValueError("Duplicate (metadata_id, node_id): use one row with feature lists")
+    for col in ["node_type", "node_subtype"]:
+        if (df.groupby("node_id")[col].nunique() > 1).any():
+            raise ValueError(f"A node_id has conflicting {col} annotations")
+    schemas = {}
+    vectors = []
+    for row in df.itertuples(index=False):
+        ns, vs = _features(row.feature_name, row.feature_value, f"node={row.node_id}, metadata_id={row.metadata_id}")
+        if row.node_type in schemas and schemas[row.node_type] != ns:
+            raise ValueError(f"Inconsistent feature names/order for node type {row.node_type!r}; expected {schemas[row.node_type]}, got {ns}")
+        schemas[row.node_type] = ns
+        vectors.append(vs)
+    df["_feature_vector"] = vectors
+    annotation = df.drop_duplicates("node_id").set_index("node_id")
+    return df, schemas, annotation["node_type"].to_dict(), annotation["node_subtype"].to_dict()
+
 
 @dataclass
-class BaseGRNConfig:
-    tf_peak_scores_csv: Optional[str] = None
-    peaks_genes_csv: Optional[str] = None
-    out_plot_dir: str = "plots/base_grn"
-    plot_filename: str = "base_grn_degree_distributions.png"
-    tf_col: str = "tf"
-    peak_col: str = "peak"
-    gene_col: str = "gene"
-    tf_score_col: str = "score_z"
-    mode: str = "multiome"
-    tf_score_agg: str = "max"  
-    dist_agg: str = "min"  
+class BaseGraphConfig:
+    edge_csv: str
+    node_csv: str
+    out_plot_dir: str = "plots/base_graph"
+    plot_filename: str = "base_graph_degree_distributions.png"
 
-class BaseGRN:
-    def __init__(self, cfg: BaseGRNConfig):
+
+class BaseGraph:
+    def __init__(self, cfg):
         self.cfg = cfg
-        assert self.cfg.mode in ("multiome", "rna_only")
-        self.tf_peak_df: Optional[pd.DataFrame] = None
-        self.peaks_genes_df: Optional[pd.DataFrame] = None
-        self.all_genes: Optional[pd.Index] = None
-        self.all_cres: Optional[pd.Index] = None
-        self.gene_to_id: Dict[str, int] = {}
-        self.cre_to_id: Dict[str, int] = {}
-        self.graph: Optional[HeteroData] = None
-        self.dataset: Optional[PerCellGraphDataset] = None
+        self.graph = None
+        self.edge_df = None
+        self.node_df = None
 
-    def create_base_grn(self, save_graph_pt: Optional[str] = None) -> HeteroData:
+    def _load(self):
+        self.node_df, self.feature_names_by_type, self.node_type, self.node_subtype = _nodes(self.cfg.node_csv)
+        self.edge_df = _read(self.cfg.edge_csv)
+        _require(self.edge_df, ["left_node", "right_node", "is_directional"], "edge.csv")
+        _ids(self.edge_df, ["left_node", "right_node"], "edge.csv")
+        self.edge_df["is_directional"] = self.edge_df["is_directional"].map(_direction)
+        endpoints = set(self.edge_df["left_node"]) | set(self.edge_df["right_node"])
+        missing = endpoints - set(self.node_type)
+        if missing:
+            raise ValueError(f"Edge endpoints absent from node.csv: {sorted(missing)[:10]}")
+
+    def _build_node_indices(self):
+        self.node_types = sorted(set(self.node_type.values()))
+        self.node_names = {t: sorted(n for n in self.node_type if self.node_type[n] == t) for t in self.node_types}
+        self.node_to_local_id = {t: {n:i for i,n in enumerate(ns)} for t,ns in self.node_names.items()}
+        names = [n for t in self.node_types for n in self.node_names[t]]
+        self.node_to_global_id = {n:i for i,n in enumerate(names)}
+        self.global_id_to_node = {i:(self.node_type[n],n) for n,i in self.node_to_global_id.items()}
+
+    def _build_graph(self):
+        g = HeteroData()
+        for t, names in self.node_names.items():
+            g[t].num_nodes = len(names)
+            g[t].names = names
+            g[t].global_id = torch.tensor([self.node_to_global_id[n] for n in names], dtype=torch.long)
+        pairs = set()
+        for source,target,directional in self.edge_df[["left_node","right_node","is_directional"]].itertuples(index=False, name=None):
+            pairs.add((source,target))
+            if not directional:
+                pairs.add((target,source))
+        self.edge_to_global_id = {pair:i for i,pair in enumerate(sorted(pairs))}
+        self.global_id_to_edge = {i:p for p,i in self.edge_to_global_id.items()}
+        groups = defaultdict(list)
+        for source,target in sorted(pairs):
+            groups[(self.node_type[source],"edge",self.node_type[target])].append((source,target))
+        for e, edges in groups.items():
+            g[e].edge_index = torch.tensor([[self.node_to_local_id[e[0]][s] for s,t in edges],
+                                           [self.node_to_local_id[e[2]][t] for s,t in edges]], dtype=torch.long)
+            g[e].edge_attr = torch.empty((len(edges),0), dtype=torch.float32)
+            g[e].global_edge_id = torch.tensor([self.edge_to_global_id[p] for p in edges], dtype=torch.long)
+        return g
+
+    def create_base_graph(self, save_graph_pt=None):
         self._load()
-        if self.cfg.mode == "multiome":
-            self._build_indices_multiome()
-            e_g2c, a_g2c = self._build_binds()
-            e_c2g, a_c2g = self._build_regulates()
-            self.graph = self._pack_multiome(e_g2c, a_g2c, e_c2g, a_c2g)
-        else:
-            self._build_indices_rna_only()
-            e_g2g, a_g2g = self._build_direct_tf_gene()
-            self.graph = self._pack_rna_only(e_g2g, a_g2g)
-        
+        self._build_node_indices()
+        self.graph = self._build_graph()
         self.save_degree_plot()
         if save_graph_pt:
+            Path(save_graph_pt).parent.mkdir(parents=True, exist_ok=True)
             torch.save(self.graph, save_graph_pt)
-            print(f"[BaseGRN] Saved base graph ({self.cfg.mode}) -> {os.path.abspath(save_graph_pt)}")
-        return self.graph
+        return self.graph, self.edge_df, self.node_type, self.node_to_global_id, self.edge_to_global_id
 
-    def _load(self) -> None:
-        self.tf_peak_df = pd.read_csv(self.cfg.tf_peak_scores_csv)
-        self.peaks_genes_df = pd.read_csv(self.cfg.peaks_genes_csv)
-
-        need_tf = {self.cfg.tf_col, self.cfg.peak_col, self.cfg.tf_score_col}
-        need_pg = {self.cfg.peak_col, self.cfg.gene_col}
-
-
-        missing_tf = need_tf - set(self.tf_peak_df.columns)
-        missing_pg = need_pg - set(self.peaks_genes_df.columns)
-        if missing_tf:
-            raise ValueError(f"tf_peak_scores_csv missing columns: {sorted(missing_tf)}")
-        if missing_pg:
-            raise ValueError(f"peaks_genes_csv missing columns: {sorted(missing_pg)}")
-
-        self.tf_peak_df[self.cfg.tf_col] = self.tf_peak_df[self.cfg.tf_col].astype(str)
-        self.tf_peak_df[self.cfg.peak_col] = self.tf_peak_df[self.cfg.peak_col].astype(str)
-
-        self.peaks_genes_df[self.cfg.peak_col] = self.peaks_genes_df[self.cfg.peak_col].astype(str)
-        self.peaks_genes_df[self.cfg.gene_col] = self.peaks_genes_df[self.cfg.gene_col].astype(str)
-
-        print("[BaseGRN] Loaded:")
-        print(f"  - mode:          {self.cfg.mode}")
-        print(f"  - tf_peak_scores {self.tf_peak_df.shape}")
-        print(f"  - peaks_genes    {self.peaks_genes_df.shape}")
-
-    def _build_indices_multiome(self) -> None:
-        tfs = set(self.tf_peak_df[self.cfg.tf_col].astype(str).unique())
-        targets = set(self.peaks_genes_df[self.cfg.gene_col].astype(str).unique())
-
-        overlap = tfs & targets
-        tf_only = tfs - targets
-        target_only = targets - tfs
-
-        all_genes = pd.Index(sorted(tfs | targets))
-        all_cres = pd.Index(self.tf_peak_df[self.cfg.peak_col].astype(str)).append(
-            pd.Index(self.peaks_genes_df[self.cfg.peak_col].astype(str))
-        ).unique()
-
-        self.all_genes = all_genes
-        self.all_cres = all_cres
-        self.gene_to_id = {g: i for i, g in enumerate(all_genes)}
-        self.cre_to_id = {c: i for i, c in enumerate(all_cres)}
-
-        print("\n[BaseGRN] Unified nodes (multiome):")
-        print(f"  - TFs:                 {len(tfs)}")
-        print(f"  - Targets (genes):     {len(targets)}")
-        print(f"  - TF ∩ Target:         {len(overlap)}")
-        print(f"  - TF only:             {len(tf_only)}")
-        print(f"  - Target only:         {len(target_only)}")
-        print(f"  - Genes (TF ∪ Target): {len(all_genes)}")
-        print(f"  - CREs:                {len(all_cres)}")
-
-    def _build_binds(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        df = self.tf_peak_df[[self.cfg.tf_col, self.cfg.peak_col, self.cfg.tf_score_col]].dropna().copy()
-        df[self.cfg.tf_col] = df[self.cfg.tf_col].astype(str)
-        df[self.cfg.peak_col] = df[self.cfg.peak_col].astype(str)
-
-        mask = np.array(
-            [(t in self.gene_to_id) and (p in self.cre_to_id)
-            for t, p in zip(df[self.cfg.tf_col].values, df[self.cfg.peak_col].values)],
-            dtype=bool
-        )
-        df = df.loc[mask]
-
-        src = [self.gene_to_id[t] for t in df[self.cfg.tf_col].values]   
-        dst = [self.cre_to_id[p]  for p in df[self.cfg.peak_col].values] 
-
-        a = df[[self.cfg.tf_score_col]].astype(float).values  
-        return torch.tensor([src, dst], dtype=torch.long), torch.tensor(a, dtype=torch.float32)
-
-    def _build_regulates(self) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        df = self.peaks_genes_df[[self.cfg.peak_col, self.cfg.gene_col]].dropna(
-            subset=[self.cfg.peak_col, self.cfg.gene_col]
-        ).copy()
-
-        df[self.cfg.peak_col] = df[self.cfg.peak_col].astype(str)
-        df[self.cfg.gene_col] = df[self.cfg.gene_col].astype(str)
-
-        mask = np.array(
-            [(p in self.cre_to_id) and (g in self.gene_to_id)
-            for p, g in zip(df[self.cfg.peak_col].values, df[self.cfg.gene_col].values)],
-            dtype=bool
-        )
-        df = df.loc[mask]
-
-        src = [self.cre_to_id[p] for p in df[self.cfg.peak_col].values]
-        dst = [self.gene_to_id[g] for g in df[self.cfg.gene_col].values]
-
-        feats = np.zeros((len(src), 0), dtype=float)
-
-        return (
-            torch.tensor([src, dst], dtype=torch.long),
-            torch.tensor(feats, dtype=torch.float32),
-        )
-
-    
-    def _pack_multiome(self, e_g2c, a_g2c, e_c2g, a_c2g) -> HeteroData:
-        g = HeteroData()
-        g["gene"].num_nodes = len(self.all_genes)
-        g["cre"].num_nodes = len(self.all_cres)
-        g["gene"].names = list(self.all_genes)
-        g["cre"].names = list(self.all_cres)
-
-        g["gene", "binds", "cre"].edge_index = e_g2c
-        g["gene", "binds", "cre"].edge_attr  = a_g2c
-
-        g["cre", "regulates", "gene"].edge_index = e_c2g
-        g["cre", "regulates", "gene"].edge_attr  = a_c2g
-        return g
-    
-    def _build_indices_rna_only(self) -> None:
-        tfs = set(self.tf_peak_df[self.cfg.tf_col].astype(str).unique())
-        targets = set(self.peaks_genes_df[self.cfg.gene_col].astype(str).unique())
-
-        overlap = tfs & targets
-        tf_only = tfs - targets
-        target_only = targets - tfs
-
-        all_genes = pd.Index(sorted(tfs | targets))
-
-        self.all_genes = all_genes
-        self.all_cres = pd.Index([])          
-        self.gene_to_id = {g: i for i, g in enumerate(all_genes)}
-        self.cre_to_id = {}                   
-
-        print("\n[BaseGRN] Unified nodes (rna_only):")
-        print(f"  - TFs:                 {len(tfs)}")
-        print(f"  - Targets (genes):     {len(targets)}")
-        print(f"  - TF ∩ Target:         {len(overlap)}")
-        print(f"  - TF only:             {len(tf_only)}")
-        print(f"  - Target only:         {len(target_only)}")
-        print(f"  - Genes (TF ∪ Target): {len(all_genes)}")
-
-
-    def _build_direct_tf_gene(self):
-        tf_df = self.tf_peak_df[[self.cfg.tf_col, self.cfg.peak_col, self.cfg.tf_score_col]].dropna().copy()
-        pg_df = self.peaks_genes_df[[self.cfg.peak_col, self.cfg.gene_col]].dropna(
-            subset=[self.cfg.peak_col, self.cfg.gene_col]
-        ).copy()
-
-        
-        tf_df[self.cfg.peak_col] = tf_df[self.cfg.peak_col].astype(str).str.strip()
-        pg_df[self.cfg.peak_col] = pg_df[self.cfg.peak_col].astype(str).str.strip()
-
-        merged = tf_df.merge(pg_df, on=self.cfg.peak_col, how="inner")
-
-        merged = (merged
-            .groupby([self.cfg.tf_col, self.cfg.gene_col], as_index=False)
-            .agg({
-                self.cfg.tf_score_col: self.cfg.tf_score_agg,  
-                self.cfg.peak_col: "size",
-            })
-            .rename(columns={self.cfg.peak_col: "n_paths"})
-        )
-        merged["n_paths_log1p"] = np.log1p(merged["n_paths"].astype(float))
-
-        mask = np.array(
-            [(t in self.gene_to_id) and (g in self.gene_to_id)
-            for t, g in zip(merged[self.cfg.tf_col].astype(str).values,
-                             merged[self.cfg.gene_col].astype(str).values)],
-            dtype=bool
-        )
-        merged = merged.loc[mask]
-
-        src = [self.gene_to_id[t] for t in merged[self.cfg.tf_col].astype(str).values]
-        dst = [self.gene_to_id[g] for g in merged[self.cfg.gene_col].astype(str).values]
-
-        edge_attr = merged[[self.cfg.tf_score_col, "n_paths_log1p"]].astype(float).values  
-
-        e = torch.tensor([src, dst], dtype=torch.long)
-        a = torch.tensor(edge_attr, dtype=torch.float32)
-        return e, a
-
-    
-    def _pack_rna_only(self, e_g2g: torch.Tensor, a_g2g: torch.Tensor) -> HeteroData:
-        g = HeteroData()
-        g["gene"].num_nodes = len(self.all_genes)
-        g["gene"].names = list(self.all_genes)
-
-        g["gene", "regulates", "gene"].edge_index = e_g2g
-        g["gene", "regulates", "gene"].edge_attr  = a_g2g
-        return g
-
-
-    def save_degree_plot(self) -> str:
-        os.makedirs(self.cfg.out_plot_dir, exist_ok=True)
-        out_path = os.path.join(self.cfg.out_plot_dir, self.cfg.plot_filename)
-
+    def save_degree_plot(self):
+        import matplotlib.pyplot as plt
         if self.graph is None:
-            raise RuntimeError("Graph not built yet. Call create_base_grn() first.")
+            raise RuntimeError("Call create_base_graph first")
+        path = Path(self.cfg.out_plot_dir)/self.cfg.plot_filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        edges = list(self.graph.edge_types)
+        fig, ax = plt.subplots(figsize=(10,4))
+        ax.bar(range(len(edges)), [self.graph[e].edge_index.shape[1] for e in edges])
+        ax.set_xticks(range(len(edges)))
+        ax.set_xticklabels([" -> ".join(e) for e in edges], rotation=45, ha="right")
+        ax.set_ylabel("Number of edges")
+        ax.set_title("Edge counts by edge type")
+        fig.tight_layout()
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        return str(path)
 
-        g = self.graph
-
-        def degree_counts(indices: torch.Tensor) -> List[int]:
-            c = defaultdict(int)
-            for i in indices.detach().cpu().tolist():
-                c[int(i)] += 1
-            return list(c.values())
-
-        if self.cfg.mode == "multiome":
-            src_tf, dst_cre = g["gene", "binds", "cre"].edge_index
-            src_cre, dst_gene = g["cre", "regulates", "gene"].edge_index
-
-            tf_out = degree_counts(src_tf)
-            cre_in = degree_counts(dst_cre)
-            cre_out = degree_counts(src_cre)
-            gene_in = degree_counts(dst_gene)
-
-            fig, axs = plt.subplots(2, 2, figsize=(12, 8))
-            axs = axs.flatten()
-
-            axs[0].hist(tf_out, bins=30);  axs[0].set_title("TF → CRE (TF out-degree)")
-            axs[1].hist(cre_in, bins=30);  axs[1].set_title("TF → CRE (CRE in-degree)")
-            axs[2].hist(cre_out, bins=30); axs[2].set_title("CRE → Gene (CRE out-degree)")
-            axs[3].hist(gene_in, bins=30); axs[3].set_title("CRE → Gene (Gene in-degree)")
-
-            plt.tight_layout()
-            fig.suptitle("Edge degree distributions (multiome)", fontsize=16, y=1.03)
-            fig.savefig(out_path, dpi=200, bbox_inches="tight")
-            plt.close(fig)
-
-        else: 
-            src, dst = g["gene", "regulates", "gene"].edge_index
-
-            out_deg = degree_counts(src)  
-            in_deg = degree_counts(dst)   
-
-            fig, axs = plt.subplots(1, 2, figsize=(12, 4))
-
-            axs[0].hist(out_deg, bins=30)
-            axs[0].set_title("Gene→Gene (source out-degree)")
-
-            axs[1].hist(in_deg, bins=30)
-            axs[1].set_title("Gene→Gene (target in-degree)")
-
-            plt.tight_layout()
-            fig.suptitle("Edge degree distributions (rna_only)", fontsize=16, y=1.05)
-            fig.savefig(out_path, dpi=200, bbox_inches="tight")
-            plt.close(fig)
-
-        print(f"[BaseGRN] Degree plot saved -> {os.path.abspath(out_path)}")
-        return out_path
-
-
-
-# ============================================================
-# 2) Auto-discovery for feature_mtx/
-# ============================================================
 
 @dataclass
-class AutoDiscoveredFiles:
-    barcodes_file: str
-    tf_features: str
-    gene_features: str
-
-    tf_raw_mtx: str
-    gene_raw_mtx: str
-
-    tf_sct_mtx: str
-    gene_sct_mtx: str
-
-    cre_features: Optional[str] = None
-    cre_counts_raw_mtx: Optional[str] = None
-    cre_counts_mtx: Optional[str] = None
+class UnifiedFiles:
+    edge_csv: str
+    node_csv: str
+    metadata_csv: str
 
 
-class AutoFeatureLoader:
-    def __init__(self, experiment_dir: str):
-        self.experiment_dir = os.path.abspath(experiment_dir)
-        self.feature_mtx_dir = os.path.join(experiment_dir, "interm", "feature_mtx")
-        self.raw_dir = os.path.join(self.feature_mtx_dir, "raw")
-        self.processed_dir = os.path.join(self.feature_mtx_dir, "processed")
-
-    def discover(self, mode: str = "multiome") -> AutoDiscoveredFiles:
-        assert mode in ("multiome", "rna_only")
-
-        for dir_path, name in [
-            (self.feature_mtx_dir, "feature_mtx"),
-            (self.raw_dir, "raw"),
-            (self.processed_dir, "processed"),
-        ]:
-            if not os.path.isdir(dir_path):
-                raise FileNotFoundError(f"{name} dir not found: {dir_path}")
-
-        def _find_one(base_dir: str, candidates: List[str], label: str) -> str:
-            for name in candidates:
-                path = os.path.join(base_dir, name)
-                if os.path.exists(path):
-                    return path
-            for pat in candidates:
-                hits = glob.glob(os.path.join(base_dir, pat))
-                if hits:
-                    return sorted(hits)[0]
-            raise FileNotFoundError(f"Missing {label} in {base_dir}. Tried: {candidates}")
-
-        # feature_mtx dir (txt files)
-        barcodes = _find_one(self.feature_mtx_dir, ["barcodes.txt", "*barcodes*.txt"], "barcodes.txt")
-        tf_features = _find_one(self.feature_mtx_dir, ["tf_features.txt", "tf*features*.txt"], "tf_features.txt")
-        gene_features = _find_one(self.feature_mtx_dir, ["gene_features.txt", "gene*features*.txt"], "gene_features.txt")
-
-        # raw dir (mtx files)
-        tf_raw_mtx = _find_one(self.raw_dir, ["tf_raw.mtx", "tf*raw*.mtx"], "tf_raw.mtx")
-        gene_raw_mtx = _find_one(self.raw_dir, ["gene_raw.mtx", "gene*raw*.mtx"], "gene_raw.mtx")
-
-        # processed dir (mtx files)
-        tf_sct_mtx = _find_one(self.processed_dir, ["tf_sct.mtx", "tf*sct*.mtx"], "tf_sct.mtx")
-        gene_sct_mtx = _find_one(self.processed_dir, ["gene_sct.mtx", "gene*sct*.mtx"], "gene_sct.mtx")
-
-        # default CRE to None for rna_only
-        cre_features = None
-        cre_counts_raw_mtx = None
-        cre_counts_mtx = None
-
-        if mode == "multiome":
-            cre_features = _find_one(self.feature_mtx_dir, ["cre_features.txt", "cre*features*.txt"], "cre_features.txt")
-            cre_counts_raw_mtx = _find_one(self.raw_dir, ["cre_counts_raw.mtx", "cre*raw*.mtx"], "cre_counts_raw.mtx")
-            cre_counts_mtx = _find_one(self.processed_dir, ["cre_counts.mtx", "cre*counts*.mtx"], "cre_counts.mtx")
-
-        files = AutoDiscoveredFiles(
-            barcodes_file=barcodes,
-            tf_features=tf_features,
-            gene_features=gene_features,
-            tf_raw_mtx=tf_raw_mtx,
-            gene_raw_mtx=gene_raw_mtx,
-            tf_sct_mtx=tf_sct_mtx,
-            gene_sct_mtx=gene_sct_mtx,
-            cre_features=cre_features,
-            cre_counts_raw_mtx=cre_counts_raw_mtx,
-            cre_counts_mtx=cre_counts_mtx,
-        )
-
-        print(f"[discover] Found (mode={mode}):")
-        for k, v in files.__dict__.items():
-            if v is None:
-                continue
-
-            name = os.path.basename(v) if isinstance(v, str) else "None"
-            print(f"  - {k}: {name}")
-        return files
-
+class UnifiedLoader:
     @staticmethod
-    def _read_names(path: str) -> List[str]:
-        return pd.read_csv(path, header=None)[0].astype(str).tolist()
+    def validate_files(files):
+        for path in [files.edge_csv,files.node_csv,files.metadata_csv]:
+            if not Path(path).is_file():
+                raise FileNotFoundError(path)
 
-    @staticmethod
-    def _read_mtx(path: str):
-        return mmread(path).tocsc()
-
-    def load_all(self, files: AutoDiscoveredFiles, mode: str = "multiome") -> Dict[str, Tuple[Any, List[str], List[str]]]:
-        assert mode in ("multiome", "rna_only")
-        barcodes = self._read_names(files.barcodes_file)
-
-        def load_triplet(mtx_path: str, feat_path: str, key: str):
-            if mtx_path is None or feat_path is None:
-                raise ValueError(f"[{key}] missing path(s): mtx_path={mtx_path}, feat_path={feat_path}")
-            mat = self._read_mtx(mtx_path)
-            feats = self._read_names(feat_path)
-            if mat.shape != (len(feats), len(barcodes)):
-                raise ValueError(f"[{key}] shape mismatch {mat.shape} vs {(len(feats), len(barcodes))}")
-            print(f"[load] {key:12s} shape={mat.shape}")
-            return mat, feats, barcodes
-
-        mats: Dict[str, Tuple[Any, List[str], List[str]]] = {}
-
-        mats["tf_feat"] = load_triplet(files.tf_sct_mtx, files.tf_features, "tf_feat")
-        mats["gene_feat"] = load_triplet(files.gene_sct_mtx, files.gene_features, "gene_feat")
-
-        mats["tf_raw"] = load_triplet(files.tf_raw_mtx, files.tf_features, "tf_raw")
-        mats["gene_raw"] = load_triplet(files.gene_raw_mtx, files.gene_features, "gene_raw")
-
-        if mode == "multiome":
-            if files.cre_counts_mtx is None or files.cre_counts_raw_mtx is None or files.cre_features is None:
-                raise FileNotFoundError("mode=multiome but CRE files are missing (cre_features/cre_counts*.mtx).")
-            mats["cre_feat"] = load_triplet(files.cre_counts_mtx, files.cre_features, "cre_feat")
-            mats["cre_raw"] = load_triplet(files.cre_counts_raw_mtx, files.cre_features, "cre_raw")
-
-        return mats
-
-
-# ============================================================
-# 3) Per-cell dataset 
-# ============================================================
-
-class PerCellGraphDataset(Dataset):
-    def __init__(self,
-                 base_graph,
-                 cells,
-                 tf_mtx_dict, tf_names,
-                 gene_mtx_dict, gene_names,
-                 cre_mtx_dict, cre_names,
-                 gene_node_names, cre_node_names,
-                 labels_dict=None,
-                 label_to_id=None,          
-                 prune=True,
-                 raw_expr_matrices=None,
-                 min_cells_per_class=None,
-                 max_cells_per_class=None,
-                 mode: str = "multiome"):
-        assert mode in ("multiome", "rna_only")
-        self.mode = mode
-        self.base_graph = base_graph
-        self.tf_mtx_dict = tf_mtx_dict
-        self.gene_mtx_dict = gene_mtx_dict
-
-        self.tf_names = tf_names
-        self.gene_names = gene_names
-
-        self.gene_node_names = gene_node_names
-
-        self.prune = prune
-        self.raw_expr_matrices = raw_expr_matrices if prune else {}
-
-        if self.mode == "rna_only":
-            self.cre_mtx_dict = {}
-            self.cre_names = []
-            self.cre_node_names = []
+    def load(self, files, *, node_df=None, feature_names_by_type=None, edge_df=None):
+        self.validate_files(files)
+        if node_df is None:
+            node_df, feature_names_by_type, _, _ = _nodes(files.node_csv)
+        metadata = _read(files.metadata_csv)
+        _require(metadata,["sample_id","cell_id","label"],"metadata.csv")
+        if metadata.empty:
+            raise ValueError("metadata.csv is empty")
+        for c in ["sample_id","cell_id","label"]:
+            metadata[c] = metadata[c].str.strip()
+        if metadata["label"].eq("").any():
+            raise ValueError("Missing graph labels; supervised dataset requires labels")
+        valid_sample = metadata["sample_id"].ne("")
+        per_sample = metadata.loc[valid_sample].groupby("sample_id")["cell_id"].nunique()
+        level = "cell" if (per_sample > 1).any() or not valid_sample.all() else "sample"
+        if level == "cell":
+            if metadata["cell_id"].eq("").any() or metadata["cell_id"].duplicated().any():
+                raise ValueError("Cell graphs require nonempty, globally unique cell_id values")
+            observations = metadata["cell_id"].tolist()
+            lookup = dict(zip(observations,observations))
+            label_map = dict(zip(observations,metadata["label"]))
         else:
-            self.cre_mtx_dict = cre_mtx_dict or {}
-            self.cre_names = cre_names or []
-            self.cre_node_names = cre_node_names or []
+            if metadata["sample_id"].duplicated().any():
+                raise ValueError("Sample graphs require exactly one metadata row per sample_id")
+            observations = metadata["sample_id"].tolist()
 
-        self.master_cols = list(cells)
-        self.barcode2col = {cid: i for i, cid in enumerate(self.master_cols)}
+            keys = metadata["cell_id"].where(metadata["cell_id"].ne(""),metadata["sample_id"])
+            if keys.duplicated().any():
+                raise ValueError("Ambiguous metadata IDs across samples")
+            lookup = dict(zip(keys,observations))
+            label_map = dict(zip(observations,metadata["label"]))
+        unknown = set(node_df["metadata_id"]) - set(lookup)
+        if unknown:
+            raise ValueError(f"node.csv metadata_id not found in metadata.csv: {sorted(unknown)[:10]}")
+        node_observations = {o:{} for o in observations}
+        feature_values = {o:{} for o in observations}
+        for row in node_df.itertuples(index=False, name=None):
+            values = dict(zip(node_df.columns,row))
+            o = lookup[values["metadata_id"]]
+            t,n = values["node_type"],values["node_id"]
+            node_observations[o].setdefault(t,[]).append(n)
+            feature_values[o].setdefault(t,{})[n] = values["_feature_vector"]
+        empty = [o for o in observations if not node_observations[o]]
+        if empty:
+            raise ValueError(f"Observations with no nodes: {empty[:10]}")
+        for by_type in node_observations.values():
+            for t in by_type:
+                by_type[t].sort()
+        return dict(edge_df=edge_df,metadata=metadata,graph_level=level,
+                    observation_ids=observations,labels_dict=label_map,
+                    node_observations=node_observations,feature_values=feature_values,
+                    feature_names_by_type=feature_names_by_type)
 
-        self.global_label_to_id_input = dict(label_to_id) if label_to_id is not None else None
 
+class GeneralGraphDataset(Dataset):
+    def __init__(self, base_graph, edge_df, node_type, node_to_global_id,
+                 edge_to_global_id, observation_ids, node_observations, feature_values,
+                 labels_dict=None, label_to_id=None, min_obs_per_class=None,
+                 max_obs_per_class=None, *, feature_names_by_type,
+                 node_subtype=None, metadata=None, graph_level=None):
+        self.base_graph,self.edge_df,self.node_type = base_graph,edge_df,node_type
+        self.node_to_global_id,self.edge_to_global_id = node_to_global_id,edge_to_global_id
+        self.global_id_to_node = {i:(node_type[n],n) for n,i in node_to_global_id.items()}
+        self.global_id_to_edge = {i:p for p,i in edge_to_global_id.items()}
+        self.feature_names_by_type = feature_names_by_type
+        self.input_dims = {t:len(ns) for t,ns in feature_names_by_type.items()}
+        self.node_subtype = node_subtype or {}
+        self.metadata,self.graph_level = metadata,graph_level
+        self.observation_ids = list(observation_ids)
+        self.observation_to_index = {o:i for i,o in enumerate(observation_ids)}
+        self.node_observations,self.feature_values = node_observations,feature_values
+        self.labels_dict,self.label_to_id,self.id_to_label = None,None,None
+        kept = self.observation_ids
         if labels_dict is not None:
-            from collections import Counter
-            counts = Counter([labels_dict[c] for c in self.master_cols if c in labels_dict])
-            valid_labels = {
-                lab for lab, cnt in counts.items()
-                if (min_cells_per_class is None or cnt >= min_cells_per_class)
-                and (max_cells_per_class is None or cnt <= max_cells_per_class)
-            }
-            kept = [c for c in self.master_cols if labels_dict.get(c) in valid_labels]
-            self.labels_dict = {c: labels_dict[c] for c in kept}
-
-            surviving_labels = sorted(set(self.labels_dict.values()))
-            self.orig_label_to_compact = {lab: i for i, lab in enumerate(surviving_labels)}
-            self.compact_to_orig = {i: lab for lab, i in self.orig_label_to_compact.items()}
-
-            self.label_to_id = dict(self.orig_label_to_compact)   
-            self.id_to_label = dict(self.compact_to_orig)         
-
-            print(f"[Labels] Pruned to {len(surviving_labels)} classes; remapped to contiguous IDs 0..{len(surviving_labels)-1}")
-            if self.global_label_to_id_input is not None:
-                print(f"[Labels] (Info) Received a global label_to_id with {len(self.global_label_to_id_input)} entries; "
-                      f"kept only surviving labels and rebuilt a compact mapping for training.")
-        else:
-            kept = self.master_cols
-            self.labels_dict = None
-            self.label_to_id = None
-            self.id_to_label = None
-            self.orig_label_to_compact = None
-            self.compact_to_orig = None
-
-        self.all_cells = list(kept)
-        self.cell_id_to_col = {cid: self.barcode2col[cid] for cid in self.all_cells}
-
-        self.gene_pos = {g: i for i, g in enumerate(gene_node_names)}
-        if self.mode == "multiome":
-            self.cre_pos = {p: i for i, p in enumerate(self.cre_node_names)}
-        else:
-            self.cre_pos = {}
-
-        def _build_row_map(src_names, dst_pos):
-            src_rows, dst_nodes = [], []
-            for i, name in enumerate(src_names):
-                j = dst_pos.get(name)
-                if j is None:
-                    continue
-                src_rows.append(i)
-                dst_nodes.append(j)
-            return (np.asarray(src_rows, dtype=np.int64),
-                    torch.as_tensor(dst_nodes, dtype=torch.long))
-
-        self.tf_src_rows, self.tf_dst_nodes = _build_row_map(self.tf_names, self.gene_pos)
-        self.gene_src_rows, self.gene_dst_nodes = _build_row_map(self.gene_names, self.gene_pos)
-
-        if self.mode == "multiome":
-            self.cre_src_rows, self.cre_dst_nodes = _build_row_map(self.cre_names, self.cre_pos)
-        else:
-            self.cre_src_rows = np.asarray([], dtype=np.int64)
-            self.cre_dst_nodes = torch.empty((0,), dtype=torch.long)
-        
-        self.valid_cells = []
-        for cid in self.all_cells:
-            g = self.build_graph(cid)
-            if g is not None:
-                self.valid_cells.append(cid)
-
-        print(f"Kept {len(self.valid_cells)} cells ")
+            counts = pd.Series([labels_dict[o] for o in observation_ids]).value_counts()
+            valid = {lab for lab,count in counts.items()
+                     if (min_obs_per_class is None or count >= min_obs_per_class)
+                     and (max_obs_per_class is None or count <= max_obs_per_class)}
+            kept = [o for o in observation_ids if labels_dict[o] in valid]
+            self.labels_dict = {o:labels_dict[o] for o in kept}
+            # Contiguous labels are rebuilt after whole-class filtering.
+            self.label_to_id = {lab:i for i,lab in enumerate(sorted(valid))}
+            self.id_to_label = {i:lab for lab,i in self.label_to_id.items()}
+        if not kept:
+            raise ValueError("No observations remain after label filtering")
+        self.valid_observation_ids = list(kept)
+        self._edge_groups = defaultdict(list)
+        for (s,t),gid in edge_to_global_id.items():
+            self._edge_groups[(node_type[s],"edge",node_type[t])].append((s,t,gid))
 
     def __len__(self):
-        return len(self.valid_cells)
+        return len(self.valid_observation_ids)
 
-    def __getitem__(self, idx):
-        cid = self.valid_cells[idx]
-        g = self.build_graph(cid)
-        if g is None:
-            raise IndexError(f"[__getitem__] Failed to build graph for {cid}")
+    def __getitem__(self,idx):
+        return self.build_graph(self.valid_observation_ids[idx])
+
+    def build_graph(self,observation_id):
+        if observation_id not in self.node_observations:
+            raise KeyError(observation_id)
+        g = HeteroData()
+        local = {}
+        observed = self.node_observations[observation_id]
+        for t in self.base_graph.node_types:
+            names = sorted(observed.get(t,[]))
+            local[t] = {n:i for i,n in enumerate(names)}
+            g[t].num_nodes = len(names)
+            g[t].names = names
+            vectors = [self.feature_values[observation_id][t][n] for n in names]
+            g[t].x = torch.tensor(vectors,dtype=torch.float32).reshape(len(names),self.input_dims[t])
+            g[t].global_id = torch.tensor([self.node_to_global_id[n] for n in names],dtype=torch.long)
+        for e in self.base_graph.edge_types:
+            edges = [(local[e[0]][s],local[e[2]][t],gid)
+                     for s,t,gid in self._edge_groups[e]
+                     if s in local[e[0]] and t in local[e[2]]]
+            g[e].edge_index = torch.tensor([[s for s,t,i in edges],[t for s,t,i in edges]],dtype=torch.long)
+            g[e].edge_attr = torch.empty((len(edges),0),dtype=torch.float32)
+            g[e].global_edge_id = torch.tensor([i for s,t,i in edges],dtype=torch.long)
+
+        label = -1 if self.labels_dict is None else self.label_to_id[self.labels_dict[observation_id]]
+        g.y = torch.tensor([label],dtype=torch.long)
+        g.observation_idx = torch.tensor([self.observation_to_index[observation_id]],dtype=torch.long)
         return g
 
-    def _col_from(self, mtx, rows, col):
-        return torch.tensor(mtx[rows, col].toarray().ravel(), dtype=torch.float32)
-
-    def build_graph(self, cell_id):
-        col = self.cell_id_to_col.get(cell_id)
-        if col is None:
-            return None
-
-        try:
-            tf_cols   = [self._col_from(mtx,   self.tf_src_rows,   col) for mtx in self.tf_mtx_dict.values()]
-            gene_cols = [self._col_from(mtx, self.gene_src_rows,   col) for mtx in self.gene_mtx_dict.values()]
-            if self.mode == "multiome":
-                cre_cols = [self._col_from(mtx, self.cre_src_rows, col) for mtx in self.cre_mtx_dict.values()]
-            else:
-                cre_cols = []
-
-            tf_feats   = torch.stack(tf_cols,   dim=1) if tf_cols   else torch.zeros((len(self.tf_src_rows),   0), dtype=torch.float32)
-            gene_feats = torch.stack(gene_cols, dim=1) if gene_cols else torch.zeros((len(self.gene_src_rows), 0), dtype=torch.float32)
-            cre_feats  = torch.stack(cre_cols,  dim=1) if cre_cols  else torch.zeros((len(self.cre_src_rows),  0), dtype=torch.float32)
-        except Exception as e:
-            print(f"[build_graph] column slicing failed for cell {cell_id}: {e}")
-            return None
-
-        graph = self.base_graph.clone()
-
-        G = len(self.gene_node_names)
-
-        gene_tf_full   = torch.zeros((G, tf_feats.shape[1]),   dtype=torch.float32)
-        gene_feat_full = torch.zeros((G, gene_feats.shape[1]), dtype=torch.float32)
-
-        if tf_feats.numel() > 0:
-            gene_tf_full[self.tf_dst_nodes] = tf_feats
-        if gene_feats.numel() > 0:
-            gene_feat_full[self.gene_dst_nodes] = gene_feats
-
-
-        graph['gene'].tf_feats   = gene_tf_full
-        graph['gene'].gene_feats = gene_feat_full
-
-        if self.mode == "multiome":
-            C = len(self.cre_node_names)
-            cre_feat_full = torch.zeros((C, cre_feats.shape[1]), dtype=torch.float32)
-            if cre_feats.numel() > 0:
-                cre_feat_full[self.cre_dst_nodes] = cre_feats
-            graph["cre"].x = cre_feat_full
-
-        if self.prune:
-            graph = self.prune_graph(graph, col)
-            if graph is None:
-                return None
-        else:
-            graph['gene'].kept_idx = torch.arange(len(self.gene_node_names), dtype=torch.long)
-            if self.mode == "multiome":
-                graph["cre"].kept_idx = torch.arange(len(self.cre_node_names), dtype=torch.long)
-        
-        if self.labels_dict is not None and self.orig_label_to_compact is not None:
-            orig_lab = self.labels_dict.get(cell_id, None)
-            y_id = self.orig_label_to_compact.get(orig_lab, -1)
-            graph.y = torch.tensor([y_id], dtype=torch.long)
-        else:
-            graph.y = torch.tensor([-1], dtype=torch.long)
-
-        graph.cell_idx = torch.tensor([col], dtype=torch.long)
-
-        graph['gene'].num_nodes = graph['gene'].tf_feats.size(0)
-        if self.mode == "multiome":
-            graph['cre'].num_nodes  = graph['cre'].x.size(0)
-
-        
-        for et in getattr(graph, "edge_types", []):
-            store = graph[et]
-            if hasattr(store, "edge_attr") and store.edge_attr is not None:
-                store.edge_attr = store.edge_attr.float()
-
-        return graph
-
-    def prune_graph(self, graph, cell_col):
-        if self.mode == "multiome":
-            return self._prune_graph_multiome(graph, cell_col)
-        else:
-            return self._prune_graph_rna_only(graph, cell_col)
-
-    def _prune_graph_multiome(self, graph, cell_col):
-        ei_g2c = graph["gene", "binds", "cre"].edge_index
-        ei_c2g = graph["cre", "regulates", "gene"].edge_index
-        g_src, c_dst1 = ei_g2c
-        c_src2, g_dst = ei_c2g
-
-        tf_raw_mtx, _, _ = self.raw_expr_matrices["tf_raw"]
-        gene_raw_mtx, _, _ = self.raw_expr_matrices["gene_raw"]
-        cre_raw_mtx, _, _ = self.raw_expr_matrices["cre_raw"]
-
-        tf_expr = tf_raw_mtx[self.tf_src_rows, cell_col].toarray().ravel()
-        gene_expr = gene_raw_mtx[self.gene_src_rows, cell_col].toarray().ravel()
-        cre_counts = cre_raw_mtx[self.cre_src_rows, cell_col].toarray().ravel()
-
-        tf_nonzero = torch.zeros(len(self.gene_node_names), dtype=torch.bool)
-        gene_nonzero = torch.zeros(len(self.gene_node_names), dtype=torch.bool)
-        cre_nonzero = torch.zeros(len(self.cre_node_names), dtype=torch.bool)
-
-        tf_nonzero[self.tf_dst_nodes] = torch.from_numpy(tf_expr > 0)
-        gene_nonzero[self.gene_dst_nodes] = torch.from_numpy(gene_expr > 0)
-        cre_nonzero[self.cre_dst_nodes] = torch.from_numpy(cre_counts > 0)
-
-        keep_tf_src = torch.zeros_like(tf_nonzero); keep_tf_src[g_src] = True
-        keep_gene_tgt = torch.zeros_like(gene_nonzero); keep_gene_tgt[g_dst] = True
-        keep_gene = (keep_tf_src & tf_nonzero) | (keep_gene_tgt & gene_nonzero)
-
-        cre_in_binds = torch.zeros_like(cre_nonzero); cre_in_binds[c_dst1] = True
-        cre_in_regs = torch.zeros_like(cre_nonzero); cre_in_regs[c_src2] = True
-        keep_cre = cre_nonzero & cre_in_binds & cre_in_regs
-
-        kept_gene_idx = torch.where(keep_gene)[0]
-        kept_cre_idx = torch.where(keep_cre)[0]
-        if kept_gene_idx.numel() == 0 or kept_cre_idx.numel() == 0:
-            return None
-
-        graph["gene"].kept_idx = kept_gene_idx.clone().long()
-        graph["cre"].kept_idx = kept_cre_idx.clone().long()
-
- 
-        gene_map = -torch.ones(len(self.gene_node_names), dtype=torch.long)
-        cre_map = -torch.ones(len(self.cre_node_names), dtype=torch.long)
-        gene_map[kept_gene_idx] = torch.arange(kept_gene_idx.numel(), dtype=torch.long)
-        cre_map[kept_cre_idx] = torch.arange(kept_cre_idx.numel(), dtype=torch.long)
-
-        graph["gene"].tf_feats = graph["gene"].tf_feats[kept_gene_idx]
-        graph["gene"].gene_feats = graph["gene"].gene_feats[kept_gene_idx]
-        graph["cre"].x = graph["cre"].x[kept_cre_idx]
-
-        new_g_src = gene_map[ei_g2c[0]]
-        new_c_dst = cre_map[ei_g2c[1]]
-        mask_g2c = (new_g_src >= 0) & (new_c_dst >= 0)
-        if mask_g2c.sum() == 0:
-            return None
-        graph["gene", "binds", "cre"].edge_index = torch.stack([new_g_src[mask_g2c], new_c_dst[mask_g2c]], dim=0)
-        if hasattr(graph["gene", "binds", "cre"], "edge_attr") and graph["gene", "binds", "cre"].edge_attr is not None:
-            graph["gene", "binds", "cre"].edge_attr = graph["gene", "binds", "cre"].edge_attr[mask_g2c].float()
-
-        new_c_src = cre_map[ei_c2g[0]]
-        new_g_dst = gene_map[ei_c2g[1]]
-        mask_c2g = (new_c_src >= 0) & (new_g_dst >= 0)
-        if mask_c2g.sum() == 0:
-            return None
-        graph["cre", "regulates", "gene"].edge_index = torch.stack([new_c_src[mask_c2g], new_g_dst[mask_c2g]], dim=0)
-        if hasattr(graph["cre", "regulates", "gene"], "edge_attr") and graph["cre", "regulates", "gene"].edge_attr is not None:
-            graph["cre", "regulates", "gene"].edge_attr = graph["cre", "regulates", "gene"].edge_attr[mask_c2g].float()
-
-        N_gene = graph["gene"].tf_feats.size(0)
-        outdeg = torch.bincount(graph[("gene", "binds", "cre")].edge_index[0], minlength=N_gene)
-        indeg = torch.bincount(graph[("cre", "regulates", "gene")].edge_index[1], minlength=N_gene)
-
-        tf_nz_kept = tf_nonzero[kept_gene_idx]
-        gene_nz_kept = gene_nonzero[kept_gene_idx]
-
-        is_tf = (outdeg > 0) & tf_nz_kept
-        is_target = (indeg > 0) & gene_nz_kept
-
-        graph["gene"].is_tf = is_tf
-        graph["gene"].is_target = is_target
-
-        role_id = torch.zeros(N_gene, dtype=torch.long)
-        role_id[is_tf & ~is_target] = 1
-        role_id[is_tf & is_target] = 2
-        graph["gene"].role_id = role_id
-
-        graph["gene"].num_nodes = N_gene
-        graph["cre"].num_nodes = graph["cre"].x.size(0)
-        return graph
-    
-    def _prune_graph_rna_only(self, graph, cell_col):
-        ei = graph["gene", "regulates", "gene"].edge_index
-        src, dst = ei[0], ei[1]
-
-        tf_raw_mtx, _, _ = self.raw_expr_matrices["tf_raw"]
-        gene_raw_mtx, _, _ = self.raw_expr_matrices["gene_raw"]
-
-        tf_expr = tf_raw_mtx[self.tf_src_rows, cell_col].toarray().ravel()
-        gene_expr = gene_raw_mtx[self.gene_src_rows, cell_col].toarray().ravel()
-
-        G = len(self.gene_node_names)
-
-        tf_nonzero = torch.zeros(G, dtype=torch.bool)
-        gene_nonzero = torch.zeros(G, dtype=torch.bool)
-        tf_nonzero[self.tf_dst_nodes] = torch.from_numpy(tf_expr > 0)
-        gene_nonzero[self.gene_dst_nodes] = torch.from_numpy(gene_expr > 0)
-
-        has_out = torch.zeros(G, dtype=torch.bool); has_out[src] = True
-        has_in = torch.zeros(G, dtype=torch.bool); has_in[dst] = True
-        keep_gene = (has_out & tf_nonzero) | (has_in & gene_nonzero)
-
-
-        kept_gene_idx = torch.where(keep_gene)[0]
-        if kept_gene_idx.numel() == 0:
-            return None
-
-        graph["gene"].kept_idx = kept_gene_idx.clone().long()
-
-        gene_map = -torch.ones(G, dtype=torch.long)
-        gene_map[kept_gene_idx] = torch.arange(kept_gene_idx.numel(), dtype=torch.long)
-
-        graph["gene"].tf_feats = graph["gene"].tf_feats[kept_gene_idx]
-        graph["gene"].gene_feats = graph["gene"].gene_feats[kept_gene_idx]
-
-        new_src = gene_map[src]
-        new_dst = gene_map[dst]
-        mask_e = (new_src >= 0) & (new_dst >= 0)
-        if mask_e.sum() == 0:
-            return None
-
-        graph["gene", "regulates", "gene"].edge_index = torch.stack([new_src[mask_e], new_dst[mask_e]], dim=0)
-        if hasattr(graph["gene", "regulates", "gene"], "edge_attr") and graph["gene", "regulates", "gene"].edge_attr is not None:
-            graph["gene", "regulates", "gene"].edge_attr = graph["gene", "regulates", "gene"].edge_attr[mask_e].float()
-
-        N_gene = graph["gene"].tf_feats.size(0)
-        outdeg = torch.bincount(graph[("gene", "regulates", "gene")].edge_index[0], minlength=N_gene)
-        indeg = torch.bincount(graph[("gene", "regulates", "gene")].edge_index[1], minlength=N_gene)
-
-        tf_nz_kept = tf_nonzero[kept_gene_idx]
-        gene_nz_kept = gene_nonzero[kept_gene_idx]
-
-        is_tf = (outdeg > 0) & tf_nz_kept
-        is_target = (indeg > 0) & gene_nz_kept
-
-        graph["gene"].is_tf = is_tf
-        graph["gene"].is_target = is_target
-
-        role_id = torch.zeros(N_gene, dtype=torch.long)
-        role_id[is_tf & ~is_target] = 1
-        role_id[is_tf & is_target] = 2
-        graph["gene"].role_id = role_id
-
-        graph["gene"].num_nodes = N_gene
-        return graph
-    
-    def split(
-            self,
-            train_frac: float = 0.80,
-            test_frac: float = 0.20,
-            seed: int = 42,
-        ):
-
-            if abs((train_frac + test_frac) - 1.0) > 1e-8:
-                raise ValueError("train_frac  + test_frac must sum to 1.0")
-
-            if self.labels_dict is None or self.label_to_id is None:
-                raise ValueError("Cannot stratify/split: dataset has no labels_dict/label_to_id.")
-
-            y_all = np.array(
-                [self.label_to_id[self.labels_dict[c]] for c in self.valid_cells],
-                dtype=np.int64
-            )
-            idx = np.arange(len(y_all))
-
-            train_idx, test_idx = train_test_split(
-                idx,
-                test_size=(1.0 - train_frac),
-                stratify=y_all,
-                random_state=seed,
-            )
-
-            train_ds = Subset(self, train_idx.tolist())
-            test_ds  = Subset(self, test_idx.tolist())  
-            print("Training subset: " , len(train_ds),"\nTesting subset: " ,len(test_ds))
-            return train_ds, test_ds
-
-
-# ============================================================
-# 4) Manager: user gives only feature_dir + labels_path
-# ============================================================
-
-@dataclass
-class GRNDatasetPaths:
-    experiment_dir: str
-    tf_peak_scores_csv: Optional[str] = None
-    peaks_genes_csv: Optional[str] = None
-
-    plots_dir: str = "plots"
-    cache_dir: str = "per_cell_graphs"
-
-    label_barcode_col: str = "barcode"
-    label_value_col: str = "label"
-
-
-class GRNDatasetManager:
-    def __init__(self, paths: GRNDatasetPaths):
-        self.paths = paths
-        os.makedirs(self.paths.plots_dir, exist_ok=True)
-        self.mode: Optional[str] = None
-
-        self.base_graph: Optional[HeteroData] = None
-        self.all_genes: Optional[List[str]] = None
-        self.all_cres: Optional[List[str]] = None
-
-        self.feature_files: Optional[AutoDiscoveredFiles] = None
-        self.mats: Optional[Dict[str, Tuple[Any, List[str], List[str]]]] = None
-        self.common_barcodes: Optional[List[str]] = None
-
-        self.labels_df: Optional[pd.DataFrame] = None
-        self.labels_dict: Optional[Dict[str, str]] = None
-        self.label_to_id: Optional[Dict[str, int]] = None
-
-
-    def _discover_csvs(self) -> None:
-        csv_dir = os.path.join(self.paths.experiment_dir, "interm", "csv")
-    
-        if not os.path.isdir(csv_dir):
-            raise FileNotFoundError(f"CSV dir not found: {csv_dir}")
-    
-        def _find_file(patterns: List[str], name: str) -> str:
-            for pat in patterns:
-                hits = glob.glob(os.path.join(csv_dir, pat))
-                if hits:
-                    return sorted(hits)[0]
-            raise FileNotFoundError(f"No match in {csv_dir}: {patterns}")
-    
-        if self.paths.tf_peak_scores_csv is None:
-            self.paths.tf_peak_scores_csv = _find_file(["tf_peak_scores*.csv", "tf*peaks*.csv"],"TF peak scores CSV")
-    
-        if self.paths.peaks_genes_csv is None:
-            self.paths.peaks_genes_csv = _find_file(["peaks_genes*.csv", "peaks*genes*.csv"], "Peaks-Genes CSV")
-
-        if not hasattr(self.paths, 'labels_csv') or self.paths.labels_csv is None:
-            self.paths.labels_csv = _find_file(
-                ["*labels*.csv", "*cell_type*.csv", "*annotation*.csv", "predicted*.csv"],
-                "Labels CSV"
-            )
-
-    def build_base_grn(self, mode: str = "multiome", save_base_graph_pt: Optional[str] = None) -> HeteroData:
-        assert mode in ("multiome", "rna_only")
-        self._discover_csvs()
-        self.mode = mode
-        cfg = BaseGRNConfig(
-            tf_peak_scores_csv=self.paths.tf_peak_scores_csv,
-            peaks_genes_csv=self.paths.peaks_genes_csv,
-            out_plot_dir=os.path.join(self.paths.plots_dir, "base_grn"),
-            mode=mode,
+    def split(self,train_frac=0.80,test_frac=0.20,seed=42):
+        return dataset_split(self,train_frac,test_frac,seed)
+
+
+def build_graph_dataset(
+    edge_csv,
+    node_csv,
+    metadata_csv,
+    min_obs_per_class=None,
+    max_obs_per_class=None,
+    save_base_graph_pt=None,
+    plots_dir="plots"
+):
+    files = UnifiedFiles(
+        edge_csv,
+        node_csv,
+        metadata_csv
+    )
+
+    UnifiedLoader.validate_files(files)
+
+    builder = BaseGraph(
+        BaseGraphConfig(
+            edge_csv,
+            node_csv,
+            str(Path(plots_dir) / "base_graph")
         )
-        grn = BaseGRN(cfg)
-        self.base_graph = grn.create_base_grn(save_graph_pt=save_base_graph_pt)
+    )
 
-        self.all_genes = list(self.base_graph["gene"].names)
-        if "cre" in self.base_graph.node_types:
-            self.all_cres = list(self.base_graph["cre"].names)
-        else:
-            self.all_cres = []
-        
-        return self.base_graph
+    (
+        base,
+        edges,
+        types,
+        node_ids,
+        edge_ids
+    ) = builder.create_base_graph(
+        save_base_graph_pt
+    )
 
-    def load_feature_dir(self) -> None:
-        if self.mode is None:
-            raise RuntimeError("Call mgr.build_base_grn(mode=...) first so mode is known.")
-        loader = AutoFeatureLoader(self.paths.experiment_dir)
-        self.feature_files = loader.discover(mode=self.mode)
-        self.mats = loader.load_all(self.feature_files,mode=self.mode)
+    data = UnifiedLoader().load(
+        files,
+        node_df=builder.node_df,
+        feature_names_by_type=(
+            builder.feature_names_by_type
+        ),
+        edge_df=edges
+    )
 
-        self.common_barcodes = self.mats["tf_feat"][2]
-        print(f"[Feature] Loaded matrices for {len(self.common_barcodes)} barcodes (from barcodes.txt)")
+    ds = GeneralGraphDataset(
+        base,
+        edges,
+        types,
+        node_ids,
+        edge_ids,
+        data["observation_ids"],
+        data["node_observations"],
+        data["feature_values"],
+        labels_dict=data["labels_dict"],
+        min_obs_per_class=min_obs_per_class,
+        max_obs_per_class=max_obs_per_class,
+        feature_names_by_type=(
+            builder.feature_names_by_type
+        ),
+        node_subtype=builder.node_subtype,
+        metadata=data["metadata"],
+        graph_level=data["graph_level"]
+    )
 
-    def inspect_cell_distribution(
-        self,
-        min_cells_per_class: Optional[int] = None,
-        max_cells_per_class: Optional[int] = None,
-        save_plot: bool = True,
-        plot_dir: Optional[str] = None
-    ) -> pd.Series:
-    
-        if self.common_barcodes is None:
-            raise RuntimeError("Run load_feature_dir() first (need barcodes).")
+    print(
+        f"[build_graph_dataset] Built {len(ds)} "
+        f"{ds.graph_level} graphs."
+    )
 
-        self._discover_csvs()
-        df = pd.read_csv(self.paths.labels_csv)
-        bc_col = self.paths.label_barcode_col
-        y_col  = self.paths.label_value_col
-        if bc_col not in df.columns or y_col not in df.columns:
-            raise ValueError(f"labels_csv must contain columns: '{bc_col}', '{y_col}'")
+    print(
+        f"[build_graph_dataset] Features per node type: "
+        f"{ds.input_dims}"
+    )
 
-        df[bc_col] = df[bc_col].astype(str)
-        df[y_col]  = df[y_col].astype(str)
+    return ds
 
-        in_feat = set(self.common_barcodes)
-        df = df[df[bc_col].isin(in_feat)].copy()
+def summarize_dataset(
+    dataset,
+    max_graphs: Optional[int] = None,
+    plot_dir: str = "plots/dataset_summary",
+    dpi: int = 200
+) -> dict:
+   
 
-        self.labels_df = df
-        self.labels_dict = dict(zip(df[bc_col], df[y_col]))
-        labs = sorted(set(self.labels_dict.values()))
-        self.label_to_id = {lab: i for i, lab in enumerate(labs)}
-
-        counts = df[y_col].value_counts()
-
-        if min_cells_per_class is not None:
-            counts = counts[counts >= min_cells_per_class]
-        if max_cells_per_class is not None:
-            counts = counts[counts <= max_cells_per_class]
-
-        print("\n[Cell distribution] (after intersect with feature barcodes)")
-
-        if save_plot:
-            out_dir = plot_dir  or os.path.join(self.paths.plots_dir, "dataset")
-            Path(out_dir).mkdir(parents=True, exist_ok=True)
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.bar(counts.index.tolist(), counts.values)
-            ax.set_title("Cell Type Distribution (intersected)")
-            ax.set_ylabel("Count")
-            ax.set_xticklabels(counts.index.tolist(), rotation=45, ha="right")
-            fig.tight_layout()
-            p = os.path.join(out_dir, "cell_type_distribution.png")
-            fig.savefig(p, dpi=200, bbox_inches="tight")
-            plt.close(fig)
-            print(f"[inspect_plot] Saved -> {os.path.abspath(p)}")
-
-        return counts
-
-    def build_per_cell_dataset(self, prune: bool = True,
-                               min_cells_per_class: Optional[int] = 50,
-                               max_cells_per_class: Optional[int] = None) -> PerCellGraphDataset:
-        if self.mode is None:
-            raise RuntimeError("Call build_base_grn(mode=...) first.")
-        if self.base_graph is None:
-            raise RuntimeError("Run build_base_grn() first.")
-        if self.mats is None or self.common_barcodes is None:
-            raise RuntimeError("Run load_feature_dir() first.")
-        if self.paths.labels_csv is not None and self.labels_dict is None:
-            self.inspect_cell_distribution(save_plot=False)
-
-        tf_mat, tf_names, _ = self.mats["tf_feat"]
-        gene_mat, gene_names, _ = self.mats["gene_feat"] 
-        cells = self.common_barcodes
-        raw_expr_matrices = self.mats if prune else None
-
-        if self.mode == "multiome":
-            cre_mat, cre_names, _ = self.mats["cre_feat"]
-            cre_mtx_dict = {"cre_feat": cre_mat}
-            cre_names_arg = cre_names
-            cre_node_names = self.all_cres
-        
-        else:
-            cre_mtx_dict = {}
-            cre_names_arg = []
-            cre_node_names = []
-
-
-        ds = PerCellGraphDataset(
-            base_graph=self.base_graph,
-            cells=cells,
-            tf_mtx_dict={"tf_feat": tf_mat}, tf_names=tf_names,
-            gene_mtx_dict={"gene_feat": gene_mat}, gene_names=gene_names,
-            cre_mtx_dict=cre_mtx_dict, cre_names=cre_names_arg,
-            gene_node_names=self.all_genes,
-            cre_node_names=cre_node_names,
-            mode=self.mode,
-            labels_dict=self.labels_dict,
-            label_to_id=self.label_to_id,
-            prune=prune,
-            raw_expr_matrices=raw_expr_matrices,
-            min_cells_per_class=min_cells_per_class,
-            max_cells_per_class=max_cells_per_class
+    if isinstance(dataset, Subset):
+        base_dataset = dataset.dataset
+        indices = list(
+            dataset.indices
+        )
+    else:
+        base_dataset = dataset
+        indices = list(
+            range(len(dataset))
         )
 
-        return ds
-    
-    def summarize_dataset(self, dataset, max_graphs=None, plot_dir=None, dpi=200):
-        if plot_dir is None:
-            plot_dir = os.path.join(self.paths.plots_dir, "dataset_summary")
-        os.makedirs(plot_dir, exist_ok=True)
+    if max_graphs is not None:
+        indices = indices[
+            :int(max_graphs)
+        ]
 
-        ntotal = len(dataset)
-        n = ntotal if max_graphs is None else min(ntotal, int(max_graphs))
+    os.makedirs(
+        plot_dir,
+        exist_ok=True
+    )
 
-        print("\nDataset Summary")
-        print("=" * 60)
-        print(f"Total cells/graphs: {ntotal}")
-        if max_graphs is not None:
-            print(f"Summarizing only:   {n}")
-        print(f"Plots will be saved in: {os.path.abspath(plot_dir)}")
+    node_types = list(
+        base_dataset.feature_names_by_type.keys()
+    )
 
-        base_ds = dataset
-        subset_indices = None
-        if isinstance(dataset, Subset):
-            base_ds = dataset.dataset
-            subset_indices = list(dataset.indices)
+    edge_types = list(
+        base_dataset.base_graph.edge_types
+    )
 
-        if hasattr(base_ds, "labels_dict") and base_ds.labels_dict is not None and hasattr(base_ds, "valid_cells"):
-            if subset_indices is None:
-                cids = base_ds.valid_cells[:n]
-            else:
-                cids = [base_ds.valid_cells[i] for i in subset_indices[:n]]
+    node_counts = {
+        node_type: []
+        for node_type in node_types
+    }
 
-            labels = [base_ds.labels_dict.get(cid, "Unknown") for cid in cids]
-            counts = pd.Series(labels).value_counts()
+    edge_counts = {
+        edge_type: []
+        for edge_type in edge_types
+    }
 
-            print("\n[Labels] Distribution (over summarized graphs):")
-            print(counts)
+    labels = []
 
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.bar(counts.index.tolist(), counts.values)
-            ax.set_title("Cell Type Distribution")
-            ax.set_ylabel("Count")
-            ax.set_xticks(range(len(counts)))
-            ax.set_xticklabels(counts.index.tolist(), rotation=45, ha="right")
-            fig.tight_layout()
-            out = os.path.join(plot_dir, "label_distribution.png")
-            fig.savefig(out, dpi=dpi, bbox_inches="tight")
-            plt.close(fig)
-            print(f"[saved] {out}")
+    for idx in indices:
+        graph = base_dataset[
+            idx
+        ]
 
-        gene_node_counts = []
-        cre_node_counts = []
+        label_id = int(
+            graph.y.item()
+        )
 
-        tf_edge_counts = []       
-        target_edge_counts = []   
-        g2g_edge_counts = []      
+        if label_id >= 0:
+            labels.append(
+                base_dataset.id_to_label[
+                    label_id
+                ]
+            )
+        else:
+            labels.append(
+                "unknown"
+            )
 
-        tf_node_counts = []
-        target_node_counts = []
-        autoreg_tf_counts = []
-
-        tf_feat_dim = None
-        gene_feat_dim = None
-        cre_feat_dim = None
-
-        for i in range(n):
-            g = dataset[i]
-
-            gene_store = g["gene"]
-            tf_feats = getattr(gene_store, "tf_feats", None)
-            gene_feats = getattr(gene_store, "gene_feats", None)
-
-            if tf_feats is None or gene_feats is None:
-                raise RuntimeError(
-                    "Expected g['gene'].tf_feats and g['gene'].gene_feats to exist. "
-                    "Check PerCellGraphDataset.build_graph()."
+        for node_type in node_types:
+            if node_type in graph.node_types:
+                node_counts[
+                    node_type
+                ].append(
+                    graph[
+                        node_type
+                    ].num_nodes
                 )
-
-            if tf_feat_dim is None:
-                tf_feat_dim = int(tf_feats.shape[1])
-            if gene_feat_dim is None:
-                gene_feat_dim = int(gene_feats.shape[1])
-
-            gene_node_counts.append(int(tf_feats.shape[0]))
-
-            has_cre = ("cre" in getattr(g, "node_types", [])) and hasattr(g["cre"], "x")
-            if has_cre:
-                cre_x = g["cre"].x
-                cre_node_counts.append(int(cre_x.shape[0]))
-                if cre_feat_dim is None:
-                    cre_feat_dim = int(cre_x.shape[1])
             else:
-                cre_node_counts.append(0)
+                node_counts[
+                    node_type
+                ].append(0)
 
-            edge_types = set(getattr(g, "edge_types", []))
-
-            if ("gene", "binds", "cre") in edge_types:
-                e_g2c = g[("gene", "binds", "cre")].edge_index
-                tf_edge_counts.append(int(e_g2c.shape[1]))
-                tf_nodes = torch.unique(e_g2c[0]) if e_g2c.numel() else torch.empty((0,), dtype=torch.long)
+        for edge_type in edge_types:
+            if edge_type in graph.edge_types:
+                edge_counts[
+                    edge_type
+                ].append(
+                    graph[
+                        edge_type
+                    ].edge_index.size(1)
+                )
             else:
-                if ("gene", "regulates", "gene") in edge_types:
-                    e_g2g = g[("gene", "regulates", "gene")].edge_index
-                    tf_edge_counts.append(int(e_g2g.shape[1]))
-                    tf_nodes = torch.unique(e_g2g[0]) if e_g2g.numel() else torch.empty((0,), dtype=torch.long)
-                else:
-                    tf_edge_counts.append(0)
-                    tf_nodes = torch.empty((0,), dtype=torch.long)
+                edge_counts[
+                    edge_type
+                ].append(0)
 
-            if ("cre", "regulates", "gene") in edge_types:
-                e_c2g = g[("cre", "regulates", "gene")].edge_index
-                target_edge_counts.append(int(e_c2g.shape[1]))
-                tgt_nodes = torch.unique(e_c2g[1]) if e_c2g.numel() else torch.empty((0,), dtype=torch.long)
-            else:
-                if ("gene", "regulates", "gene") in edge_types:
-                    e_g2g = g[("gene", "regulates", "gene")].edge_index
-                    target_edge_counts.append(int(e_g2g.shape[1]))
-                    tgt_nodes = torch.unique(e_g2g[1]) if e_g2g.numel() else torch.empty((0,), dtype=torch.long)
-                else:
-                    target_edge_counts.append(0)
-                    tgt_nodes = torch.empty((0,), dtype=torch.long)
+    label_counts = pd.Series(
+        labels
+    ).value_counts()
 
-            if ("gene", "regulates", "gene") in edge_types:
-                g2g_edge_counts.append(int(g[("gene", "regulates", "gene")].edge_index.shape[1]))
-            else:
-                g2g_edge_counts.append(0)
+    print("Dataset summary")
+    print("-" * 60)
+    print(
+        f"Graph level: "
+        f"{base_dataset.graph_level}"
+    )
+    print(
+        f"Total graphs: "
+        f"{len(dataset)}"
+    )
+    print(
+        f"Summarized graphs: "
+        f"{len(indices)}"
+    )
 
-            tf_node_counts.append(int(tf_nodes.numel()))
-            target_node_counts.append(int(tgt_nodes.numel()))
+    print("\nLabel distribution:")
+    print(label_counts)
 
-            if hasattr(gene_store, "role_id") and gene_store.role_id is not None:
-                autoreg_tf_counts.append(int((gene_store.role_id == 2).sum().item()))
-            else:
-                autoreg_tf_counts.append(0)
+    print("\nNode counts:")
 
-        def _save_hist(data, title, xlabel, fname):
-            if len(data) == 0:
-                return
-            fig, ax = plt.subplots(figsize=(6, 3.5))
-            ax.hist(data, bins=20, edgecolor="black")
-            ax.set_title(title)
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel("Graph Count")
-            fig.tight_layout()
-            out = os.path.join(plot_dir, fname)
-            fig.savefig(out, dpi=dpi, bbox_inches="tight")
-            plt.close(fig)
-            print(f"[saved] {out}")
+    for node_type in node_types:
+        values = node_counts[
+            node_type
+        ]
 
-        _save_hist(gene_node_counts, "Gene node count per graph", "Genes", "gene_nodes_hist.png")
-        _save_hist(tf_node_counts, "TF source node count per graph", "TF/Regulators", "tf_nodes_hist.png")
-        _save_hist(target_node_counts, "Target node count per graph", "Targets", "target_nodes_hist.png")
-        _save_hist(autoreg_tf_counts, "Autoregulated TFs per graph", "Autoreg TFs", "autoreg_tfs_hist.png")
+        if values:
+            print(
+                f" - {node_type}: "
+                f"mean={np.mean(values):.1f}, "
+                f"median={np.median(values):.1f}, "
+                f"min={min(values)}, "
+                f"max={max(values)}"
+            )
 
-        if any(c > 0 for c in cre_node_counts):
-            _save_hist(cre_node_counts, "CRE node count per graph", "CREs", "cre_nodes_hist.png")
-            _save_hist(tf_edge_counts, "TF→CRE edge count per graph", "TF→CRE edges", "tf_cre_edges_hist.png")
-            _save_hist(target_edge_counts, "CRE→Gene edge count per graph", "CRE→Gene edges", "cre_gene_edges_hist.png")
-        else:
-            if any(e > 0 for e in g2g_edge_counts):
-                _save_hist(g2g_edge_counts, "Gene→Gene edge count per graph", "Gene→Gene edges", "gene_gene_edges_hist.png")
+    print("\nEdge counts:")
 
-        print("\n[Stats] Averages over summarized graphs:")
-        print(f"  Avg gene nodes:          {np.mean(gene_node_counts):.1f}")
-        if any(c > 0 for c in cre_node_counts):
-            print(f"  Avg CRE nodes:           {np.mean(cre_node_counts):.1f}")
-            print(f"  Avg TF→CRE edges:        {np.mean(tf_edge_counts):.1f}")
-            print(f"  Avg CRE→Gene edges:      {np.mean(target_edge_counts):.1f}")
-        else:
-            if any(e > 0 for e in g2g_edge_counts):
-                print(f"  Avg Gene→Gene edges:     {np.mean(g2g_edge_counts):.1f}")
-            print(f"  Avg regulator nodes:     {np.mean(tf_node_counts):.1f}")
-            print(f"  Avg target nodes:        {np.mean(target_node_counts):.1f}")
+    for edge_type in edge_types:
+        values = edge_counts[
+            edge_type
+        ]
 
-        print("\n[Dims] Feature dimensionality:")
-        print(f"  TF feature dim:          {tf_feat_dim if tf_feat_dim is not None else 'NA'}")
-        print(f"  Gene feature dim:        {gene_feat_dim if gene_feat_dim is not None else 'NA'}")
-        if any(c > 0 for c in cre_node_counts):
-            print(f"  CRE feature dim:         {cre_feat_dim if cre_feat_dim is not None else 'NA'}")
+        if values:
+            print(
+                f" - {' -> '.join(edge_type)}: "
+                f"mean={np.mean(values):.1f}, "
+                f"median={np.median(values):.1f}, "
+                f"min={min(values)}, "
+                f"max={max(values)}"
+            )
+
+    print("\nFeature dimensions:")
+
+    for node_type in node_types:
+        print(
+            f" - {node_type}: "
+            f"{base_dataset.input_dims[node_type]} "
+            f"features"
+        )
+
+    def save_hist(
+        values,
+        title,
+        xlabel,
+        filename
+    ):
+        if not values:
+            return
+
+        fig, ax = plt.subplots(
+            figsize=(6, 3.5)
+        )
+
+        ax.hist(
+            values,
+            bins=20,
+            edgecolor="black"
+        )
+
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Graph count")
+
+        fig.tight_layout()
+
+        out_path = os.path.join(
+            plot_dir,
+            filename
+        )
+
+        fig.savefig(
+            out_path,
+            dpi=dpi,
+            bbox_inches="tight"
+        )
+        plt.close(fig)
+
+    for node_type in node_types:
+        save_hist(
+            node_counts[node_type],
+            f"{node_type} node count per graph",
+            f"Number of {node_type} nodes",
+            f"{node_type}_node_count_histogram.png"
+        )
+
+    for edge_type in edge_types:
+        edge_name = "_".join(
+            edge_type
+        )
+
+        save_hist(
+            edge_counts[edge_type],
+            f"{' -> '.join(edge_type)} edge count",
+            "Number of edges",
+            f"{edge_name}_edge_count_histogram.png"
+        )
+
+    label_plot_path = os.path.join(
+        plot_dir,
+        "label_distribution.png"
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(10, 4)
+    )
+
+    ax.bar(
+        label_counts.index.tolist(),
+        label_counts.values.tolist()
+    )
+
+    ax.set_title("Label distribution")
+    ax.set_ylabel("Number of graphs")
+    ax.set_xticks(
+        range(
+            len(label_counts)
+        )
+    )
+    ax.set_xticklabels(
+        label_counts.index.tolist(),
+        rotation=45,
+        ha="right"
+    )
+
+    fig.tight_layout()
+    fig.savefig(
+        label_plot_path,
+        dpi=dpi,
+        bbox_inches="tight"
+    )
+    plt.close(fig)
+
+    return {
+        "graph_level": (
+            base_dataset.graph_level
+        ),
+        "total_graphs": len(
+            dataset
+        ),
+        "summarized_graphs": len(
+            indices
+        ),
+        "label_counts": (
+            label_counts.to_dict()
+        ),
+        "node_counts": node_counts,
+        "edge_counts": edge_counts,
+        "feature_dimensions": (
+            base_dataset.input_dims
+        ),
+        "plot_dir": plot_dir
+    }
+
+def dataset_split(
+    dataset,
+    train_frac=0.80,
+    test_frac=0.20,
+    seed=42
+):
+    if (
+        not 0 < train_frac < 1 or
+        not 0 < test_frac < 1 or
+        not np.isclose(
+            train_frac + test_frac,
+            1
+        )
+    ):
+        raise ValueError(
+            "Positive train_frac and test_frac "
+            "must sum to 1"
+        )
+
+    if dataset.labels_dict is None:
+        raise ValueError(
+            "Stratified splitting requires labels"
+        )
+
+    labels = [
+        dataset.label_to_id[
+            dataset.labels_dict[
+                observation_id
+            ]
+        ]
+        for observation_id in (
+            dataset.valid_observation_ids
+        )
+    ]
+
+    a, b = train_test_split(
+        np.arange(len(dataset)),
+        test_size=test_frac,
+        stratify=labels,
+        random_state=seed
+    )
+
+    train_dataset = Subset(
+        dataset,
+        a.tolist()
+    )
+
+    test_dataset = Subset(
+        dataset,
+        b.tolist()
+    )
+
+    print(
+        f"[dataset_split] Train graphs: "
+        f"{len(train_dataset)}"
+    )
+
+    print(
+        f"[dataset_split] Test graphs: "
+        f"{len(test_dataset)}"
+    )
+
+    return train_dataset, test_dataset
